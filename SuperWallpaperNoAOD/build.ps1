@@ -27,11 +27,17 @@ if ($LASTEXITCODE -ne 0) { throw "d8 failed" }
 
 Write-Output "== aapt2 =="
 $resZip = "$base\build\res.zip"
-& "$bt\aapt2.exe" compile --dir "$base\res" -o $resZip 2>&1
-if ($LASTEXITCODE -ne 0) { throw "aapt2 compile failed" }
 $unsigned = "$base\build\unsigned.apk"
-& "$bt\aapt2.exe" link -o $unsigned -I "$plat" --manifest "$base\AndroidManifest.xml" --min-sdk-version 26 --target-sdk-version 36 $resZip 2>&1
-if ($LASTEXITCODE -ne 0) { throw "aapt2 link failed" }
+# aapt2 在含非 ASCII 字符的绝对路径上会打开目录失败（Windows 编码 bug），改用项目内相对路径
+Push-Location $base
+try {
+    & "$bt\aapt2.exe" compile --dir "res" -o "build\res.zip" 2>&1
+    if ($LASTEXITCODE -ne 0) { throw "aapt2 compile failed" }
+    & "$bt\aapt2.exe" link -o "build\unsigned.apk" -I "$plat" --manifest "AndroidManifest.xml" --min-sdk-version 26 --target-sdk-version 36 "build\res.zip" 2>&1
+    if ($LASTEXITCODE -ne 0) { throw "aapt2 link failed" }
+} finally {
+    Pop-Location
+}
 
 Write-Output "== add dex + assets =="
 Copy-Item "$dex\classes.dex" "$stage\classes.dex"
@@ -48,7 +54,12 @@ if ($LASTEXITCODE -ne 0) { throw "zipalign failed" }
 Write-Output "== sign =="
 $ks = "$base\build\debug.keystore"
 if (-not (Test-Path $ks)) {
+    # keytool 把进度信息写到 stderr，Stop 下会误判为错误 -> 临时降级并检查退出码
+    $oldEap = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
     & $keytool -genkeypair -keystore $ks -storepass android -alias androiddebugkey -keypass android -dname "CN=Android Debug,O=Android,C=US" -keyalg RSA -keysize 2048 -validity 10000 2>&1 | Out-Null
+    $ErrorActionPreference = $oldEap
+    if ($LASTEXITCODE -ne 0) { throw "keytool failed" }
 }
 $final = if ($OutApk) { $OutApk } else { "$base\SuperWallpaperNoAOD.apk" }
 & "$bt\apksigner.bat" sign --ks $ks --ks-pass pass:android --key-pass pass:android --out $final $aligned 2>&1
