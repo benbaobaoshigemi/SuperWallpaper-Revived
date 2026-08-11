@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.miui.superwallpapernoaod">
+    <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="36" />
+    <application
+        android:allowBackup="false"
+        android:hasCode="true"
+        android:label="超级壁纸保留主题AOD">
+        <meta-data android:name="xposedmodule" android:value="true" />
+        <meta-data android:name="xposeddescription"
+            android:value="禁止超级壁纸接管AOD：保持主题/息屏AOD不变，锁屏与桌面动效不受影响" />
+        <meta-data android:name="xposedminversion" android:value="82" />
+        <meta-data android:name="xposedscope" android:resource="@array/xposedscope" />
+    </application>
+</manifest>

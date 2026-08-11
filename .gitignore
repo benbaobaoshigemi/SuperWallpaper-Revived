@@ -1,0 +1,10 @@
+# 构建产物（可再生）
+SuperWallpaperNoAOD/build/
+
+# 大体积/可再生二进制：设备拉取与反编译产物
+*.apk
+*.dex
+
+# jadx 反编译输出（可再生，文件量大）
+_analysis/jadx-out/
+_analysis/*_dex/
