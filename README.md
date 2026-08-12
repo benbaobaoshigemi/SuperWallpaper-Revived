@@ -1,96 +1,128 @@
-# SuperWallpaper-Revived · 把息屏还给主题，把动效还给锁屏
+# SuperWallpaper-Revived
 
-超级壁纸问世时，理念是超前的，效果是惊艳的：3D 实时渲染的月球跟着真实月相盈亏，地球在指尖缓缓转动——到今天，也很少有壁纸能在锁屏上复刻这种质感。
+面向 HyperOS 的 LSPosed 模块，用于调整小米超级壁纸、锁屏与 AOD 之间的协作方式。
 
-只是它没能跟上系统的脚步。新一代息屏（AOD）自成体系，超级壁纸却还按老规矩接管一切：一应用，AOD 被它抢走，桌面到锁屏的转场也成了生硬瞬切。这个 Xposed / LSPosed 模块，就是把这套超前体验接回今天的系统：**AOD 继续交给主题与息屏应用**，桌面 → 锁屏保留完整转场，锁屏 → AOD 保持静帧、不再刷新样式。
+项目的核心目标是把 AOD 交还给系统主题和息屏应用，同时保留超级壁纸在桌面、锁屏之间的原生转场。模块不替换壁纸资源，也不修改系统显示刷新率。
 
 ## 功能
 
-- **AOD 不被超级壁纸接管**：屏蔽 `aod_using_super_wallpaper` 置位、吞掉 AOD 广播 / 命令 / 入口方法，AOD 始终显示当前主题样式（锁屏时钟或全屏 AOD）。
-- **桌面 → 锁屏转场保留**：息屏路径原发 `ForceLock`（场景侧瞬移、硬切），模块按引擎状态改写为 `Lock`（摄像机插值动画），动画结束后停在锁屏视角，作为全屏 AOD 的静帧背景。
-- **锁屏 → AOD 保持静帧**：样式变化只允许来自桌面的动画；从锁屏息屏时不重发场景动画、不重随机位相。
-- **全屏 AOD 支持**：对缺失 `support_aod_fullscreen` 的设备（如小米 14 Ultra / aurora）强制启用“息屏样式 = 和锁屏样式一致”。
-- **恢复「自定义」入口**：锁屏长按 → 自定义锁屏、系统个性化 → 超级壁纸主题的“自定义”按钮与编辑页预览刷新。
-- **可选禁用 AOD → 锁屏缩放**：设置页开关会拦截超级壁纸引擎的 `WallpaperService.Engine.onZoomChanged`，只作用于 AOD/锁屏状态。
-- **可选复用原厂全屏 AOD 压暗**：默认开启，沿用 SystemUI 的 `wallpaperBlack` 亮度曲线；关闭后跳过该压暗调用。
-- **全局壁纸缩放**：跟随 MIUI Home 原厂壁纸缩放状态，在应用打开/退出时复用超级壁纸 `ZoomIn` / `ZoomOut` 动效。
-- **AOD 下持续渲染**：实验性拦截可覆盖的 Java 暂停与不可见路径，尽可能让超级壁纸在 AOD / Doze 中继续渲染。
-- **带 UI 的作用域管理**：显示声明的作用域、打开 LSPosed 设置，并在 root 可用时请求重启作用域进程。
-- 覆盖 Filament 系（地球 / 月球）、Unity 系（火星 / 土星 / 几何）与雪山场景。
+### AOD 与锁屏
+
+- 阻止超级壁纸接管主题 AOD，保留系统时钟或全屏 AOD 样式。
+- 支持在缺少对应能力门的设备上启用“和锁屏样式一致”的全屏 AOD 入口。
+- 桌面进入锁屏时保留超级壁纸转场；锁屏直接进入 AOD 时保持当前锁屏构图，避免重新触发场景动画。
+- 可选禁用 AOD 到锁屏时的壁纸缩放。
+- 可选复用原厂全屏 AOD 的壁纸压暗逻辑。压暗程度由 SystemUI 根据息屏亮度决定，模块不提供额外的固定百分比。
+
+### 桌面与应用转场
+
+- 可选复用 MIUI Home 的全局壁纸缩放状态，在打开和退出应用时触发超级壁纸的缩放动效。
+- 提供设置页和作用域进程重启入口。
+
+### 实验功能
+
+“AOD 下持续渲染超级壁纸”会拦截模块能够覆盖的 Java 层暂停、不可见和唤醒重置路径，尽量延长超级壁纸在锁屏、AOD 和 Doze 状态下的渲染时间。
+
+这不是对渲染持续性的保证。native、SurfaceFlinger、系统电源管理和厂商资源策略仍可能暂停渲染。模块不会创建额外渲染线程，也不会干预刷新率或显示模式。
+
+## 支持场景
+
+当前适配的场景包包括：
+
+- 地球
+- 火星
+- 土星
+- 月球
+- 雪山
+- 几何
+
+雪山使用独立的混淆渲染入口，模块对其暂停方法做了单独适配。不同场景的动画、转场和暂停机制并不完全相同，因此同一功能在各场景上的表现可能存在差异。
 
 ## 工作原理
 
-超级壁纸由若干独立场景包（`com.miui.miwallpaper.{earth,mars,saturn,moon,snowmountain,geometry}`）提供，由 `com.android.thememanager` 下发“已应用超级壁纸”广播。息屏应用 `com.miui.aod` 收到后会把 AOD 样式切换为超级壁纸专用样式并接管渲染。
+超级壁纸由独立场景包提供，主题管理器负责应用状态，`com.miui.aod` 和 `com.android.systemui` 负责 AOD 样式与壁纸合成。模块按进程边界进行 Hook：
 
-模块在各进程做最小拦截：
+1. 在主题管理器和 AOD 相关路径上，阻止超级壁纸接管 AOD 样式。
+2. 在 SystemUI 中恢复全屏 AOD 能力门、壁纸压暗复用和 AOD 到锁屏的缩放控制。
+3. 在超级壁纸场景进程中处理 `ForceLock`、`Lock`、暂停和唤醒路径，尽量保持正确的场景状态。
+4. 在 MIUI Home 中识别应用打开、退出和桌面转场，复用场景自身提供的缩放事件。
 
-1. `thememanager`：屏蔽“超级壁纸已应用”广播，`aod_using_super_wallpaper` 保持 0。
-2. `com.miui.aod` / `com.android.systemui`：强制开启全屏 AOD 能力门，恢复“和锁屏样式一致”选项与“自定义”入口。
-3. 场景包（`SuperWallpaper` 基类）：息屏路径按引擎当前状态改写 `ForceLock` 事件——
-   - 从桌面息屏 → 发 `Lock`，播放转场并顺延渲染暂停；
-   - 从锁屏息屏（锁屏 → AOD）→ 丢弃 `ForceLock`，保持当前静帧；
-   - 月球 / 地球场景额外拦截唤醒路径的 `ForceLock`，避免月球位相重随机、地球太阳构图按唤醒时刻重算导致的样式刷新（保持与 AOD 定格帧一致的构图）。
+模块只调用或拦截已有的系统和场景接口，不向壁纸 APK 注入新的资源或渲染引擎。
 
-## 支持范围
+## 设备与环境
 
-| 项目 | 说明 |
+已验证环境：
+
+| 项目 | 信息 |
 | --- | --- |
-| 设备 | 小米 14 Ultra（aurora），HyperOS / Android 14+（命令式息屏通知路径） |
+| 设备 | 小米 14 Ultra（aurora） |
+| 系统 | HyperOS / Android 14+ |
+| 框架 | LSPosed，Xposed API 82+ |
 | 场景 | 地球、火星、土星、月球、雪山、几何 |
-| 框架 | LSPosed（Xposed API 82+） |
 
-> 其它小米设备理论上可用（Filament / Unity 基类相同），但仅在本机验证过，请自行测试。
+其他小米设备可能使用相近的 Filament、Unity 或 MIUI 壁纸基类，但系统版本、场景 APK 和方法签名存在差异。未经过对应设备验证的行为应视为待验证。
 
-## 构建
+## 安装与作用域
 
-环境：Windows PowerShell、JDK 17、Android SDK（build-tools、platform android-36）。工具链会自动从 `ANDROID_HOME` / `ANDROID_SDK_ROOT` / `JAVA_HOME` 发现，也支持常见默认安装路径。
+1. 从 [Releases](https://github.com/benbaobaoshigemi/SuperWallpaper-Revived/releases) 下载 APK，并在 LSPosed 中启用模块。
+2. 为模块勾选以下作用域：
+   - `com.miui.miwallpaper`
+   - `com.miui.miwallpaper.earth`
+   - `com.miui.miwallpaper.mars`
+   - `com.miui.miwallpaper.saturn`
+   - `com.miui.miwallpaper.moon`
+   - `com.miui.miwallpaper.snowmountain`
+   - `com.miui.miwallpaper.geometry`
+   - `com.android.thememanager`
+   - `com.miui.aod`
+   - `com.android.systemui`
+   - `com.miui.home`
+3. 重启模块作用域内的进程，或重启设备。
+4. 如果需要全屏 AOD，在系统的息屏样式设置中选择“和锁屏样式一致”。
+
+模块设置页提供以下开关：
+
+- 禁用 AOD 壁纸缩放
+- AOD 壁纸压暗
+- 全局壁纸缩放
+- AOD 下持续渲染超级壁纸
+- 重启受影响的作用域进程
+
+LSPosed 没有面向普通模块的公开接口来自动修改最终作用域勾选状态。模块 Manifest 提供推荐作用域，但首次安装后仍需在 LSPosed 中确认。
+
+## 从源码构建
+
+环境要求：Windows PowerShell、JDK 17、Android SDK。SDK 至少需要对应的 Android platform 和 build-tools；Gradle 会从本机环境自动发现 SDK 和 JDK，也可以通过 `ANDROID_HOME`、`ANDROID_SDK_ROOT`、`JAVA_HOME` 指定路径。
 
 ```powershell
 .\gradlew.bat :module:assembleRelease
 ```
 
-产物：`module\build\outputs\apk\release\module-release-unsigned.apk`。发布包应使用 Gradle Release 产物签名后安装；该流程会包含 Kotlin/Compose 设置页和 Miuix 依赖。
+未签名 APK 位于：
 
-源码构建不使用 `module\build.ps1`；该脚本仅保留给历史 Java-only 调试构建，不能生成完整设置页 APK。
+```text
+module\build\outputs\apk\release\module-release-unsigned.apk
+```
 
-## 安装与作用域
-
-1. 在 LSPosed 中启用本模块并勾选以下作用域：
-   - `com.miui.miwallpaper`
-   - `com.miui.miwallpaper.earth` / `.mars` / `.saturn` / `.moon` / `.snowmountain` / `.geometry`
-   - `com.android.thememanager`
-   - `com.miui.aod`
-   - `com.android.systemui`
-   - `com.miui.home`
-2. 重启作用域内进程（或重启系统）。
-3. 设置 → 息屏 → 息屏样式：
-   - 期望 AOD 显示锁屏时钟：保持默认息屏样式；
-   - 期望全屏 AOD：勾选「和锁屏样式一致」。
-
-模块内置设置页还提供：
-
-- 禁用AOD壁纸缩放；
-- AOD壁纸压暗（默认开启）；
-- 全局壁纸缩放（默认开启）；
-- AOD下持续渲染超级壁纸（实验性）；
-- 使用 `su -c am force-stop` 请求重启上述作用域进程。
+发布或安装前需要使用自己的签名密钥签名。Gradle 构建会同时编译 Java、Kotlin、Compose UI 以及 Miuix 依赖，能够生成完整的设置页。旧的 `module\build.ps1` 仅用于历史 Java-only 调试构建，不能作为完整 UI APK 的构建流程。
 
 ## 已知限制
 
-- 全屏 AOD 的启用依赖对 `com.miui.aod` / `com.android.systemui` 的能力门 hook；不同 ROM 版本类名/方法可能有差异，失效时请提交 issue 附日志。
-- 转场暂停顺延时长为固定值（2s），个别场景动画更长时可能被截断。
-- LSPosed 没有供普通模块直接修改用户作用域勾选状态的公开 API；Manifest 的 `xposedscope` 会提供安装时的推荐作用域，最终勾选仍需用户确认。
+- 不同 HyperOS 版本可能调整类名、方法签名或 AOD 状态机，Hook 失效时需要结合设备日志重新适配。
+- “AOD 下持续渲染超级壁纸”只能覆盖 Java 层可见的暂停路径，不能绕过 native、SurfaceFlinger 或系统电源管理的最终决策。
+- 某些场景的转场动画由原厂脚本和引擎自行控制，动画长度、暂停时机和恢复行为可能不同。
+- 应用转场缩放依赖场景本身支持对应事件；不支持的场景不会产生额外动画。
+- 模块不会提高壁纸源资源的分辨率，也不会自动替换模型、贴图或材质。
+- LSPosed 的作用域最终需要用户手动确认，模块不能代替 LSPosed 修改该状态。
 
-## AOD 低频动画可行性
+## 关于 AOD 动画
 
-原厂全屏 AOD 的壁纸压暗与场景渲染是两条链路：SystemUI 通过 `wallpaperBlack` 调整壁纸合成亮度，而超级壁纸场景由独立的 Filament/Unity 引擎绘制。当前版本在保留主题 AOD 的策略下主动阻断超级壁纸 AOD 事件，并在息屏路径暂停 Filament，因此默认保持静帧。
+部分超级壁纸具备独立的动画循环。理论上可以让它们在 AOD 中继续推进，但实际效果取决于壁纸 Surface 是否仍被系统调度、场景引擎是否接受 AOD 状态以及系统电源管理是否暂停进程。
 
-地球、月球等场景本身具备 `Choreographer`/引擎动画循环，理论上可以在 AOD surface 仍由系统按低刷新率调度时恢复“每次 AOD 帧推进一次”的动画。但这需要同时验证 ROM 是否继续绑定该 wallpaper surface、AOD 的实际刷新回调频率、功耗/烧屏限制，以及各场景在 `AOD` 与 `LOCK` 状态间是否能无跳变恢复。基于当前反编译证据，这部分属于待设备实测的实验功能，本版本不默认开启。
+当前实验开关的策略是尽量放行已有渲染路径，同时不修改刷新率、不创建常驻渲染线程。系统允许时，动画可能在 AOD 中继续一段时间；系统暂停后，模块不会强行恢复。功耗、温升、低刷新调度和不同场景的兼容性仍需在具体设备上单独验证。
 
-## 免责声明
+## 许可证与免责声明
 
-本项目源于对设备内置专有软件行为的逆向分析，仅用于个人学习研究，不包含任何 MIUI / 小米的代码或资源。请遵守所在地法律与相关软件许可，因使用本项目产生的任何后果由使用者自行承担。
+本项目基于对设备内置软件行为的逆向分析，仅用于个人学习和研究。项目不包含 MIUI、小米系统或其他厂商的专有代码与资源。使用者应遵守所在地法律、设备软件许可和相关服务条款，并自行承担使用风险。
 
-## License
-
-[Apache-2.0](LICENSE)
+本项目采用 [Apache-2.0](LICENSE) 许可证。
