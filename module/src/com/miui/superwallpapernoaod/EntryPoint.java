@@ -436,6 +436,9 @@ public final class EntryPoint implements IXposedHookLoadPackage {
         hookVisibilityPauseGate(cl, pkg);
         hookRendererPause(cl, pkg, "unityPause");
         hookRendererPause(cl, pkg, "filamentPause");
+        if ("com.miui.miwallpaper.snowmountain".equals(pkg)) {
+            hookRendererPause(cl, pkg, "h");
+        }
         hookWakeRendererResume(cl, pkg, "unityResume");
         hookWakeRendererResume(cl, pkg, "filamentResume");
         // 月球场景（com.miui.mrengine.MoonMrePlayer）：
@@ -675,7 +678,8 @@ public final class EntryPoint implements IXposedHookLoadPackage {
 
     /**
      * 开关开启时，统一拦截基类可见性、延迟消息和唤醒路径最终汇聚到的
-     * unityPause/filamentPause；不区分锁屏、AOD、Doze 或 Doze Suspend。
+     * unityPause/filamentPause；雪山当前版本的 Filament 暂停入口被混淆为 h()。
+     * 不区分锁屏、AOD、Doze 或 Doze Suspend。
      * 这就是“尽人事”：native/SurfaceFlinger 等未经过这些 Java 方法的暂停不在覆盖范围内。
      */
     private void hookRendererPause(ClassLoader cl, String pkg, String methodName) {

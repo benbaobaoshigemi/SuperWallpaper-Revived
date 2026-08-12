@@ -46,10 +46,12 @@
 环境：Windows PowerShell、JDK 17、Android SDK（build-tools、platform android-36）。工具链会自动从 `ANDROID_HOME` / `ANDROID_SDK_ROOT` / `JAVA_HOME` 发现，也支持常见默认安装路径。
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File module\build.ps1
+.\gradlew.bat :module:assembleRelease
 ```
 
-产物：`module\SuperWallpaperRevived.apk`（debug 签名，安装即可）。
+产物：`module\build\outputs\apk\release\module-release-unsigned.apk`。发布包应使用 Gradle Release 产物签名后安装；该流程会包含 Kotlin/Compose 设置页和 Miuix 依赖。
+
+源码构建不使用 `module\build.ps1`；该脚本仅保留给历史 Java-only 调试构建，不能生成完整设置页 APK。
 
 ## 安装与作用域
 
