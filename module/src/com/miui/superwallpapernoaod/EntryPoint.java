@@ -315,6 +315,39 @@ public final class EntryPoint implements IXposedHookLoadPackage {
             }
         }
 
+        // 地球场景（com.miui.mrengine.EarthMrePlayer）：
+        // lockTransForm() 每次都用 getTimeScale()（当前时刻）重算锁屏太阳/光照方向（getLockSun），
+        // 唤醒路径的 ForceLock 会在唤醒时刻重算目标 -> 与 AOD 定格帧（睡眠时刻构图）不一致，造成
+        // AOD->锁屏构图跳变。LOCK 状态收到 ForceLock 时跳过（保持当前静帧），HOME 状态放行（初始锁屏）。
+        if ("com.miui.miwallpaper.earth".equals(pkg)) {
+            try {
+                XposedHelpers.findAndHookMethod("com.miui.mrengine.EarthMrePlayer", cl,
+                        "sendMessage", String.class,
+                        new XC_MethodHook() {
+                            @Override
+                            protected void beforeHookedMethod(MethodHookParam param) {
+                                if (!"ForceLock".equals(param.args[0])) {
+                                    return;
+                                }
+                                try {
+                                    Object state = XposedHelpers.getObjectField(
+                                            param.thisObject, "curState");
+                                    String st = state == null ? "" : state.toString();
+                                    if ("LOCK".equals(st)) {
+                                        log(pkg + ": earth ForceLock in LOCK -> skipped (keep static frame)");
+                                        param.setResult(null);
+                                    }
+                                } catch (Throwable t) {
+                                    logErr(pkg + ": earth sendMessage hook failed", t);
+                                }
+                            }
+                        });
+                log(pkg + ": EarthMrePlayer.sendMessage hooked");
+            } catch (Throwable t) {
+                logErr(pkg + ": EarthMrePlayer.sendMessage hook failed", t);
+            }
+        }
+
         // 雪山（整包混淆，无 onGoingToSleep/sendFilamentMessage）适配：
         // - Android U 息屏走 onCommand goingtosleep 内联分支 -> post j2.f(b!=0) -> r("ForceLock")；
         // - 旧版广播路径 q() -> post SuperWallpaper$e -> r("ForceLock")。
