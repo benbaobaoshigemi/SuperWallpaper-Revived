@@ -7,7 +7,7 @@
     <application
         android:allowBackup="false"
         android:hasCode="true"
-        android:label="超级壁纸保留主题AOD">
+        android:label="复兴超级壁纸">
         <meta-data android:name="xposedmodule" android:value="true" />
         <meta-data android:name="xposeddescription"
             android:value="禁止超级壁纸接管AOD：保持主题/息屏AOD不变，锁屏与桌面动效不受影响" />

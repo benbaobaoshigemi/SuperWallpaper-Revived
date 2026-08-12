@@ -1,6 +1,6 @@
 # SuperWallpaper-Revived · 复兴超级壁纸
 
-Xposed / LSPosed 模块：应用小米超级壁纸后，**息屏（AOD）完全交给主题 / 息屏应用**，超级壁纸引擎不再接管 AOD 动画与时钟；同时修复「桌面 → 锁屏」转场，并保证「锁屏 → AOD」不刷新场景样式。
+让小米超级壁纸恢复它本来的样子。Xposed / LSPosed 模块：应用超级壁纸后，**息屏（AOD）完全交给主题 / 息屏应用**，不再被超级壁纸引擎接管动画与时钟；同时修复「桌面 → 锁屏」转场、保证「锁屏 → AOD」保持静帧不刷新样式。
 
 ## 功能
 
@@ -42,7 +42,7 @@ Xposed / LSPosed 模块：应用小米超级壁纸后，**息屏（AOD）完全�
 powershell -ExecutionPolicy Bypass -File module\build.ps1
 ```
 
-产物：`module\SuperWallpaperNoAOD.apk`（debug 签名，安装即可）。
+产物：`module\SuperWallpaperRevived.apk`（debug 签名，安装即可）。
 
 ## 安装与作用域
 

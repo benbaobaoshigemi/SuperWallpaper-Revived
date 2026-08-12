@@ -101,7 +101,7 @@ if (-not (Test-Path $ks)) {
     $ErrorActionPreference = $oldEap
     if ($LASTEXITCODE -ne 0) { throw "keytool failed" }
 }
-$final = if ($OutApk) { $OutApk } else { "$base\SuperWallpaperNoAOD.apk" }
+$final = if ($OutApk) { $OutApk } else { "$base\SuperWallpaperRevived.apk" }
 & "$bt\apksigner.bat" sign --ks $ks --ks-pass pass:android --key-pass pass:android --out $final $aligned 2>&1
 if ($LASTEXITCODE -ne 0) { throw "apksigner failed" }
 Write-Output "== DONE: $final =="
