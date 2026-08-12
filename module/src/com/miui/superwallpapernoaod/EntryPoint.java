@@ -1,9 +1,14 @@
 package com.miui.superwallpapernoaod;
 
+import android.app.Activity;
+import android.app.KeyguardManager;
+import android.app.WallpaperManager;
 import android.content.Context;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
+import android.os.IBinder;
+import android.os.PowerManager;
 import android.provider.Settings;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
@@ -65,6 +70,10 @@ public final class EntryPoint implements IXposedHookLoadPackage {
     // 息屏瞬间引擎所处的壁纸状态（mWallpaperState）：true=从桌面息屏（发 Lock 保留转场）；
     // false=从锁屏息屏即锁屏->AOD（丢弃 ForceLock，保持当前静帧不刷新样式）。
     private static boolean sSleepFromDesk;
+    // 实验性：尽量放行所有可 Hook 到的场景渲染暂停，包括 AOD/Doze。
+    private static boolean sContinueAodRotation;
+    // AOD 唤醒回锁屏期间吞掉所有 Lock/ForceLock，直到进入桌面，保留最终静止构图。
+    private static boolean sSuppressWakeLockEvent;
 
     // 设置页模板信息 ContentObserver 窗口标志：编辑页保存样式后写
     // Settings.Secure["constant_template_editor_info"]，设置页
@@ -75,10 +84,13 @@ public final class EntryPoint implements IXposedHookLoadPackage {
     // 仅主线程（observer handler 使用 main looper）访问，无需同步。
     private static boolean sInTemplateInfoObserver;
 
-    // 桌面->锁屏 Lock 动画时长：月球 Filament 场景 1500ms，雪山 Lua 摄像机插值约 2s 收敛。
-    // 息屏路径原排 300ms 的 MSG_FILAMENT_PAUSE 会在动画中途暂停渲染 -> 顺延到动画结束再暂停，
-    // 这样转场能完整播完，且 AOD 静帧恰好停在锁屏视角；唤醒路径 onWakeUp 会 removeMessages(1) 重新排期。
-    private static final long LOCK_TRANSITION_PAUSE_MS = 2000L;
+    // SystemUI 在一次 AOD/锁屏切换中约每 8ms 调用矩阵计算；只记录每次连续缩放序列的首帧，
+    // 避免污染系统日志。数值回到 1.0 时复位，下一次切换会重新记录。
+    private static boolean sZoomSequenceLogged;
+    private static Activity sLauncherActivity;
+    private static IBinder sLauncherWindowToken;
+    private static int sLauncherWallpaperZoomState;
+    private static long sKeyguardGoingAwayUptime;
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) throws Throwable {
@@ -92,6 +104,8 @@ public final class EntryPoint implements IXposedHookLoadPackage {
             hookThemeManager(cl);
         } else if ("com.miui.miwallpaper".equals(pkg)) {
             hookMainApp(cl);
+        } else if ("com.miui.home".equals(pkg)) {
+            hookLauncherAppTransitionZoom(cl);
         } else {
             for (String scene : SCENE_PACKAGES) {
                 if (scene.equals(pkg)) {
@@ -99,6 +113,55 @@ public final class EntryPoint implements IXposedHookLoadPackage {
                     break;
                 }
             }
+        }
+    }
+
+    private void hookLauncherAppTransitionZoom(ClassLoader cl) {
+        try {
+            Class<?> wallpaperElement = XposedHelpers.findClass(
+                    "com.miui.home.recents.anim.SystemWallpaperElement", cl);
+            Class<?> wallpaperParam = XposedHelpers.findClass(
+                    "com.miui.home.recents.anim.WallpaperParam", cl);
+            XposedHelpers.findAndHookMethod(wallpaperElement, "animTo", wallpaperParam,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            if (!ModuleSettings.appTransitionZoom()) {
+                                sLauncherWallpaperZoomState = 0;
+                                return;
+                            }
+                            float zoom = XposedHelpers.getFloatField(param.args[0], "zoomOut");
+                            int state = Math.abs(zoom - 1.1969999f) < 0.01f ? 1
+                                    : Math.abs(zoom - 1.05f) < 0.01f ? 2 : 0;
+                            if (state == 0 || state == sLauncherWallpaperZoomState) return;
+                            Activity activity = sLauncherActivity;
+                            IBinder token = sLauncherWindowToken;
+                            if (activity == null || token == null) return;
+                            String action = state == 1
+                                    ? "action_open_folder" : "action_close_folder";
+                            try {
+                                WallpaperManager.getInstance(activity).sendWallpaperCommand(
+                                        token, action, 0, 0, 0, null);
+                                sLauncherWallpaperZoomState = state;
+                                log("launcher: OEM wallpaper zoom=" + zoom + " -> " + action);
+                            } catch (Throwable t) {
+                                logErr("launcher: OEM wallpaper zoom command failed", t);
+                            }
+                        }
+                    });
+            Class<?> launcherClass = XposedHelpers.findClass("com.miui.home.launcher.Launcher", cl);
+            XposedHelpers.findAndHookMethod(Activity.class, "onResume", new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    if (!launcherClass.isInstance(param.thisObject)) return;
+                    Activity activity = (Activity) param.thisObject;
+                    sLauncherActivity = activity;
+                    sLauncherWindowToken = activity.getWindow().getDecorView().getWindowToken();
+                }
+            });
+            log("launcher: OEM wallpaper state zoom hook hooked");
+        } catch (Throwable t) {
+            logErr("launcher: remote app transition wallpaper zoom hook failed", t);
         }
     }
 
@@ -181,6 +244,89 @@ public final class EntryPoint implements IXposedHookLoadPackage {
         } catch (Throwable t) {
             logErr("sysui: onWallpaperChanged hook failed", t);
         }
+
+        // 原厂全屏 AOD 的压暗链路：MiuiFullAodManager 根据息屏亮度计算
+        // wallpaperBlack(约 0.3～0.8)，再由 KeyguardPanelViewController
+        // 通过 ViewRootImpl/SurfaceControl 应用到壁纸。默认复用该逻辑；
+        // 关闭开关时仅跳过全屏 AOD 的这一步，不影响普通锁屏转场。
+        try {
+            XposedHelpers.findAndHookMethod(
+                    "com.android.keyguard.panel.KeyguardPanelViewController", cl,
+                    "doWallpaperBlackAnim", int.class, float.class, boolean.class, boolean.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            if (ModuleSettings.reuseOemFullAodDimming()) {
+                                return;
+                            }
+                            try {
+                                Object manager = XposedHelpers.getObjectField(
+                                        param.thisObject, "miuiFullAodManager");
+                                boolean fullAod = (Boolean) XposedHelpers.callMethod(manager, "fullAodEnable");
+                                if (fullAod) {
+                                    log("sysui: OEM full AOD wallpaper dimming disabled");
+                                    param.setResult(null);
+                                }
+                            } catch (Throwable t) {
+                                logErr("sysui: full AOD dimming switch failed", t);
+                            }
+                        }
+                    });
+            log("sysui:KeyguardPanelViewController.doWallpaperBlackAnim hooked");
+        } catch (Throwable t) {
+            logErr("sysui: doWallpaperBlackAnim hook failed", t);
+        }
+
+        // 全屏 AOD -> 锁屏的缩放由 SystemUI 统一处理，不走各场景 WallpaperService
+        // 的 onZoomChanged()。初始化和唤醒动画通过 setWallpaperZoom()/
+        // calculateWallpaperMatrixArray() 修改同一组壁纸 Surface。SystemUI 不按壁纸包
+        // 分流，因此该拦截覆盖所有超级壁纸场景。
+        try {
+            XposedHelpers.findAndHookMethod(
+                    "com.android.keyguard.panel.KeyguardPanelViewController", cl,
+                    "setWallpaperZoom", float.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            if (ModuleSettings.disableAodToLockZoom()) {
+                                float zoom = (Float) param.args[0];
+                                if (Math.abs(zoom - 0.75f) < 0.001f) {
+                                    log("sysui: AOD->lock wallpaper zoom replaced: " + zoom + " -> 1.0");
+                                    param.args[0] = 1.0f;
+                                }
+                            }
+                        }
+                    });
+            log("sysui:KeyguardPanelViewController.setWallpaperZoom hooked");
+        } catch (Throwable t) {
+            logErr("sysui: setWallpaperZoom hook failed", t);
+        }
+        try {
+            XposedHelpers.findAndHookMethod(
+                    "com.android.keyguard.panel.KeyguardPanelViewController", cl,
+                    "calculateWallpaperMatrixArray", float.class, float.class, float.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            if (ModuleSettings.disableAodToLockZoom()) {
+                                float scale = (Float) param.args[0];
+                                if (Math.abs(scale - 1.0f) > 0.001f) {
+                                    if (!sZoomSequenceLogged) {
+                                        sZoomSequenceLogged = true;
+                                        log("sysui: AOD->lock wallpaper matrix scale replaced: "
+                                                + scale + " -> 1.0");
+                                    }
+                                    param.args[0] = 1.0f;
+                                } else {
+                                    sZoomSequenceLogged = false;
+                                }
+                            }
+                        }
+                    });
+            log("sysui:KeyguardPanelViewController.calculateWallpaperMatrixArray hooked");
+        } catch (Throwable t) {
+            logErr("sysui: calculateWallpaperMatrixArray hook failed", t);
+        }
     }
 
     // ---------- com.android.thememanager ----------
@@ -233,6 +379,15 @@ public final class EntryPoint implements IXposedHookLoadPackage {
                         @Override
                         protected void beforeHookedMethod(MethodHookParam param) {
                             String action = (String) param.args[0];
+                            if ("android.wallpaper.wakingup".equals(action)
+                                    && ModuleSettings.continueAodRotation()) {
+                                sContinueAodRotation = true;
+                                sSuppressWakeLockEvent = true;
+                                log(pkg + ": command wakingup -> hold all lock reset events until going away");
+                            } else if ("android.wallpaper.keyguardgoingaway".equals(action)) {
+                                sContinueAodRotation = false;
+                                sSuppressWakeLockEvent = false;
+                            }
                             if ("action_aod".equals(action)
                                     || "action_force_aod".equals(action)
                                     || "action_aod_offset".equals(action)) {
@@ -247,9 +402,9 @@ public final class EntryPoint implements IXposedHookLoadPackage {
 
         // 桌面->锁屏转场（Filament 系 earth/moon 走 sendFilamentMessage，Unity 系 mars/saturn/geometry
         // 走 sendUnityMessage，规则一致）：息屏路径原发 ForceLock（场景侧瞬移 -> 硬切）。
-        // - 从桌面息屏：改发 Lock（场景侧摄像机插值动画 -> 保留转场），并顺延暂停到动画结束，
-        //   动画结束停在锁屏视角，作为全屏AOD“和锁屏样式一致”的静帧背景；
-        // - 从锁屏息屏（锁屏->AOD）：丢弃 ForceLock，场景保持当前静帧，不刷新样式。
+         // - 从桌面息屏：改发 Lock，保留场景侧摄像机插值转场；暂停时机不改写。
+         // - 从锁屏息屏（锁屏->AOD）：实验开关开启时改发 Lock，让场景进入锁屏动画链路；
+         //   暂停仍由原厂 Handler/系统生命周期处理。
         try {
             XposedHelpers.findAndHookMethod(
                     "com.miui.miwallpaper.basesuperwallpaper.SuperWallpaper$SuperWallpaperEngine", cl,
@@ -258,6 +413,8 @@ public final class EntryPoint implements IXposedHookLoadPackage {
                         @Override
                         protected void beforeHookedMethod(MethodHookParam param) {
                             sSleepPath = true;
+                            sContinueAodRotation = ModuleSettings.continueAodRotation();
+                            sSuppressWakeLockEvent = false;
                             sSleepFromDesk = true; // 读不到状态时保守按桌面处理，不破坏既有行为
                             try {
                                 String state = (String) XposedHelpers.getObjectField(
@@ -265,7 +422,8 @@ public final class EntryPoint implements IXposedHookLoadPackage {
                                 sSleepFromDesk = "show_desk".equals(state);
                             } catch (Throwable ignored) {
                             }
-                            log(pkg + ": onGoingToSleep fromDesk=" + sSleepFromDesk);
+                            log(pkg + ": onGoingToSleep fromDesk=" + sSleepFromDesk
+                                    + " aodFinitePlayback=" + sContinueAodRotation);
                         }
                     });
             log(pkg + ": onGoingToSleep hooked");
@@ -274,7 +432,12 @@ public final class EntryPoint implements IXposedHookLoadPackage {
         }
         hookSleepLockRewrite(cl, pkg, "sendFilamentMessage");
         hookSleepLockRewrite(cl, pkg, "sendUnityMessage");
-
+        hookSceneRotationLifecycle(cl, pkg);
+        hookVisibilityPauseGate(cl, pkg);
+        hookRendererPause(cl, pkg, "unityPause");
+        hookRendererPause(cl, pkg, "filamentPause");
+        hookWakeRendererResume(cl, pkg, "unityResume");
+        hookWakeRendererResume(cl, pkg, "filamentResume");
         // 月球场景（com.miui.mrengine.MoonMrePlayer）：
         // - 唤醒路径会发 ForceLock：LOCK 状态时重随机位相+瞬移，FLOCK 状态时 resume+autoRot 重启
         //   -> 唤醒/锁屏切换会刷新样式；锁屏->AOD 也会因 FLOCK 重放转场而刷新。
@@ -351,7 +514,7 @@ public final class EntryPoint implements IXposedHookLoadPackage {
         // 雪山（整包混淆，无 onGoingToSleep/sendFilamentMessage）适配：
         // - Android U 息屏走 onCommand goingtosleep 内联分支 -> post j2.f(b!=0) -> r("ForceLock")；
         // - 旧版广播路径 q() -> post SuperWallpaper$e -> r("ForceLock")。
-        // 两处 run() 前置睡眠标志，r(String) 统一把 ForceLock 改写为 Lock 并顺延暂停。
+        // 两处 run() 前置睡眠标志，r(String) 统一把 ForceLock 改写为 Lock。
         try {
             XposedHelpers.findAndHookMethod(
                     "com.miui.miwallpaper.basesuperwallpaper.SuperWallpaper$e", cl,
@@ -378,6 +541,7 @@ public final class EntryPoint implements IXposedHookLoadPackage {
                                 // b!=0（goingtosleep 传来）才发 ForceLock，避免标志泄漏。
                                 if (XposedHelpers.getIntField(param.thisObject, "b") != 0) {
                                     sSleepPath = true;
+                                    sContinueAodRotation = ModuleSettings.continueAodRotation();
                                 }
                             } catch (Throwable t) {
                                 logErr(pkg + ": snowmountain j2.f read b failed", t);
@@ -395,12 +559,25 @@ public final class EntryPoint implements IXposedHookLoadPackage {
                     new XC_MethodHook() {
                         @Override
                         protected void beforeHookedMethod(MethodHookParam param) {
+                            if (sSuppressWakeLockEvent
+                                    && ("ForceLock".equals(param.args[0])
+                                    || "Lock".equals(param.args[0]))
+                                    && ModuleSettings.continueAodRotation()) {
+                                log(pkg + ": snowmountain wake " + param.args[0]
+                                        + " suppressed (hold static frame until going away)");
+                                param.setResult(null);
+                                return;
+                            }
                             if (sSleepPath) {
                                 sSleepPath = false;
+                                sContinueAodRotation = ModuleSettings.continueAodRotation();
+                                sSuppressWakeLockEvent = false;
                                 if ("ForceLock".equals(param.args[0])) {
                                     param.args[0] = "Lock";
-                                    log(pkg + ": snowmountain sleep ForceLock -> Lock (keep desk->lock transition)");
-                                    rescheduleFilamentPause(param.thisObject);
+                                    log(pkg + ": snowmountain sleep ForceLock -> Lock (OEM pause lifecycle)");
+                                    if (sContinueAodRotation) {
+                                        rescheduleRendererPause(param.thisObject);
+                                    }
                                 }
                             }
                         }
@@ -411,8 +588,8 @@ public final class EntryPoint implements IXposedHookLoadPackage {
         }
     }
 
-    // 息屏路径消息改写：onGoingToSleep 置位后，把 ForceLock 按来源改写——
-    // 从桌面息屏 -> Lock（保留转场）；从锁屏息屏 -> 丢弃（保持静帧）。Filament/Unity 通用。
+    // 息屏路径消息改写：桌面->锁屏保留 Lock 转场；实验开启时，锁屏->AOD
+    // 也触发一次 Lock，让场景进入原厂锁屏动画链路。
     private void hookSleepLockRewrite(ClassLoader cl, String pkg, String methodName) {
         try {
             XposedHelpers.findAndHookMethod(
@@ -421,17 +598,31 @@ public final class EntryPoint implements IXposedHookLoadPackage {
                     new XC_MethodHook() {
                         @Override
                         protected void beforeHookedMethod(MethodHookParam param) {
+                            if (sSuppressWakeLockEvent
+                                    && ("ForceLock".equals(param.args[0])
+                                    || "Lock".equals(param.args[0]))
+                                    && ModuleSettings.continueAodRotation()) {
+                                log(pkg + ": wake " + param.args[0]
+                                        + " suppressed (hold static frame until going away)");
+                                param.setResult(null);
+                                return;
+                            }
                             if (!sSleepPath || !"ForceLock".equals(param.args[0])) {
                                 return;
                             }
                             sSleepPath = false;
                             if (sSleepFromDesk) {
                                 param.args[0] = "Lock";
-                                log(pkg + ": sleep(desk) " + methodName + " ForceLock -> Lock");
-                                rescheduleFilamentPause(param.thisObject);
+                                log(pkg + ": sleep(desk) " + methodName
+                                        + " ForceLock -> Lock (OEM pause lifecycle)");
+                                rescheduleRendererPause(param.thisObject);
+                            } else if (sContinueAodRotation) {
+                                param.args[0] = "Lock";
+                                log(pkg + ": sleep(lock->aod) " + methodName
+                                        + " ForceLock -> Lock (finite playback, OEM pause)");
                             } else {
                                 log(pkg + ": sleep(lock->aod) " + methodName
-                                        + " drop ForceLock (static frame)");
+                                        + " drop ForceLock (experiment disabled)");
                                 param.setResult(null);
                             }
                         }
@@ -441,6 +632,134 @@ public final class EntryPoint implements IXposedHookLoadPackage {
             logErr(pkg + ": " + methodName + " hook failed", t);
         }
     }
+
+    private void hookSceneRotationLifecycle(ClassLoader cl, String pkg) {
+        try {
+            XposedHelpers.findAndHookMethod(
+                    "com.miui.miwallpaper.basesuperwallpaper.SuperWallpaper$SuperWallpaperEngine",
+                    cl, "onWakeUp", Context.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            // onWakeUp 只代表从 AOD 回到锁屏，不代表已经进入桌面。
+                            // 从唤醒到进入桌面期间持续抑制 Lock/ForceLock，避免静止帧被重置。
+                            sContinueAodRotation = ModuleSettings.continueAodRotation();
+                            sSuppressWakeLockEvent = sContinueAodRotation;
+                            log(pkg + ": onWakeUp -> lock renderer continuation="
+                                    + sContinueAodRotation + " suppressWakeLockEvent="
+                                    + sSuppressWakeLockEvent);
+                        }
+                    });
+            log(pkg + ": onWakeUp rotation lifecycle hooked");
+        } catch (Throwable t) {
+            logErr(pkg + ": onWakeUp rotation lifecycle hook failed", t);
+        }
+        try {
+            XposedHelpers.findAndHookMethod(
+                    "com.miui.miwallpaper.basesuperwallpaper.SuperWallpaper$SuperWallpaperEngine",
+                    cl, "onKeyguardGoingAway",
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            sContinueAodRotation = false;
+                            sSuppressWakeLockEvent = false;
+                            sKeyguardGoingAwayUptime = android.os.SystemClock.uptimeMillis();
+                            log(pkg + ": onKeyguardGoingAway -> allow OEM renderer pause lifecycle");
+                        }
+                    });
+            log(pkg + ": onKeyguardGoingAway rotation lifecycle hooked");
+        } catch (Throwable t) {
+            logErr(pkg + ": onKeyguardGoingAway rotation lifecycle hook failed", t);
+        }
+    }
+
+    /**
+     * 开关开启时，统一拦截基类可见性、延迟消息和唤醒路径最终汇聚到的
+     * unityPause/filamentPause；不区分锁屏、AOD、Doze 或 Doze Suspend。
+     * 这就是“尽人事”：native/SurfaceFlinger 等未经过这些 Java 方法的暂停不在覆盖范围内。
+     */
+    private void hookRendererPause(ClassLoader cl, String pkg, String methodName) {
+        try {
+            XposedHelpers.findAndHookMethod(
+                    "com.miui.miwallpaper.basesuperwallpaper.SuperWallpaper", cl,
+                    methodName,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            if (!ModuleSettings.continueAodRotation()) {
+                                return;
+                            }
+                            log(pkg + ": " + methodName + " blocked (all renderer pause gates)");
+                            param.setResult(null);
+                        }
+                    });
+            log(pkg + ": " + methodName + " lock continuation hook hooked");
+        } catch (Throwable t) {
+            logErr(pkg + ": " + methodName + " lock continuation hook failed", t);
+        }
+    }
+
+    /**
+     * onWakeUp() 会先 resume renderer，再发送 Lock/ForceLock。引擎已被系统暂停时，
+     * resume 的第一帧会按累计时间推进，导致 AOD 静帧在 Lock/ForceLock 门控前跳变。
+     * 仅在 AOD 唤醒后仍停留锁屏的窗口拦截；进入桌面时 onKeyguardGoingAway()
+     * 先清除窗口标志，随后原厂 resume/Desk 路径照常执行。
+     */
+    private void hookWakeRendererResume(ClassLoader cl, String pkg, String methodName) {
+        try {
+            XposedHelpers.findAndHookMethod(
+                    "com.miui.miwallpaper.basesuperwallpaper.SuperWallpaper", cl,
+                    methodName,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            if (sSuppressWakeLockEvent
+                                    && ModuleSettings.continueAodRotation()) {
+                                log(pkg + ": wake " + methodName
+                                        + " suppressed (preserve AOD static frame)");
+                                param.setResult(null);
+                            }
+                        }
+                    });
+            log(pkg + ": " + methodName + " static wake frame hook hooked");
+        } catch (Throwable t) {
+            logErr(pkg + ": " + methodName + " static wake frame hook failed", t);
+        }
+    }
+
+    /**
+     * 可见性变为 false 是原厂安排延迟暂停的上游入口。实验开启时保留引擎的可见状态，
+     * 让后续真正的 pause 入口仍有机会被统一拦截；可见性恢复为 true 仍走原厂逻辑。
+     */
+    private void hookVisibilityPauseGate(ClassLoader cl, String pkg) {
+        try {
+            XposedHelpers.findAndHookMethod(
+                    "com.miui.miwallpaper.basesuperwallpaper.SuperWallpaper$SuperWallpaperEngine",
+                    cl, "onVisibilityChanged", boolean.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            boolean visible = (Boolean) param.args[0];
+                            Context context = null;
+                            Object wallpaper = null;
+                            try {
+                                wallpaper = XposedHelpers.getObjectField(param.thisObject, "this$0");
+                                context = (Context) wallpaper;
+                            } catch (Throwable ignored) {
+                            }
+                            if (!visible
+                                    && ModuleSettings.continueAodRotation()) {
+                                log(pkg + ": onVisibilityChanged(false) blocked (all renderer pause gates)");
+                                param.setResult(null);
+                            }
+                        }
+                    });
+            log(pkg + ": onVisibilityChanged pause gate hooked");
+        } catch (Throwable t) {
+            logErr(pkg + ": onVisibilityChanged pause gate hook failed", t);
+        }
+    }
+
 
     // 设置页模板信息刷新门控：仅当 SettingsConfigChangeDataSource 的 ContentObserver.onChange
     // 处理窗口内，把 TemplateApiImpl 的“壁纸由 com.miui.aod 设置（支持景深）”判断强制为 true，
@@ -556,9 +875,9 @@ public final class EntryPoint implements IXposedHookLoadPackage {
         return args;
     }
 
-    // 把息屏路径排的 MSG_FILAMENT_PAUSE(what=1, 300ms) 顺延到 Lock 动画结束之后，
-    // 避免转场中途被暂停掐断。可读包字段名 mHandler，雪山混淆包为 J。
-    private static void rescheduleFilamentPause(Object superWallpaper) {
+    // 桌面->锁屏的 Lock 动画需要先完成，再允许原厂首个 pause；之后 pause 仍按上面的
+    // Doze/锁屏状态门控处理。仅操作已有 Handler，不创建常驻线程或修改刷新率。
+    private static void rescheduleRendererPause(Object superWallpaper) {
         Object handler = null;
         try {
             handler = XposedHelpers.getObjectField(superWallpaper, "mHandler");
@@ -572,7 +891,7 @@ public final class EntryPoint implements IXposedHookLoadPackage {
         }
         if (handler instanceof Handler) {
             ((Handler) handler).removeMessages(1);
-            ((Handler) handler).sendEmptyMessageDelayed(1, LOCK_TRANSITION_PAUSE_MS);
+            ((Handler) handler).sendEmptyMessageDelayed(1, 2000L);
         }
     }
 

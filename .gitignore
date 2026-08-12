@@ -22,3 +22,15 @@ lspd_*/**/*.db
 _apply_test.txt
 _patch.txt
 lsposed-manager.apk
+
+# Gradle / IDE / local SDK
+.gradle/
+.gradle-home/
+build/
+local.properties
+.idea/
+*.iml
+
+# Local analysis and debug artifacts
+_debug/
+_miuix_zip_extract/

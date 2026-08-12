@@ -11,6 +11,11 @@
 - **锁屏 → AOD 保持静帧**：样式变化只允许来自桌面的动画；从锁屏息屏时不重发场景动画、不重随机位相。
 - **全屏 AOD 支持**：对缺失 `support_aod_fullscreen` 的设备（如小米 14 Ultra / aurora）强制启用“息屏样式 = 和锁屏样式一致”。
 - **恢复「自定义」入口**：锁屏长按 → 自定义锁屏、系统个性化 → 超级壁纸主题的“自定义”按钮与编辑页预览刷新。
+- **可选禁用 AOD → 锁屏缩放**：设置页开关会拦截超级壁纸引擎的 `WallpaperService.Engine.onZoomChanged`，只作用于 AOD/锁屏状态。
+- **可选复用原厂全屏 AOD 压暗**：默认开启，沿用 SystemUI 的 `wallpaperBlack` 亮度曲线；关闭后跳过该压暗调用。
+- **全局壁纸缩放**：跟随 MIUI Home 原厂壁纸缩放状态，在应用打开/退出时复用超级壁纸 `ZoomIn` / `ZoomOut` 动效。
+- **AOD 下持续渲染**：实验性拦截可覆盖的 Java 暂停与不可见路径，尽可能让超级壁纸在 AOD / Doze 中继续渲染。
+- **带 UI 的作用域管理**：显示声明的作用域、打开 LSPosed 设置，并在 root 可用时请求重启作用域进程。
 - 覆盖 Filament 系（地球 / 月球）、Unity 系（火星 / 土星 / 几何）与雪山场景。
 
 ## 工作原理
@@ -54,15 +59,31 @@ powershell -ExecutionPolicy Bypass -File module\build.ps1
    - `com.android.thememanager`
    - `com.miui.aod`
    - `com.android.systemui`
+   - `com.miui.home`
 2. 重启作用域内进程（或重启系统）。
 3. 设置 → 息屏 → 息屏样式：
    - 期望 AOD 显示锁屏时钟：保持默认息屏样式；
    - 期望全屏 AOD：勾选「和锁屏样式一致」。
 
+模块内置设置页还提供：
+
+- 禁用AOD壁纸缩放；
+- AOD壁纸压暗（默认开启）；
+- 全局壁纸缩放（默认开启）；
+- AOD下持续渲染超级壁纸（实验性）；
+- 使用 `su -c am force-stop` 请求重启上述作用域进程。
+
 ## 已知限制
 
 - 全屏 AOD 的启用依赖对 `com.miui.aod` / `com.android.systemui` 的能力门 hook；不同 ROM 版本类名/方法可能有差异，失效时请提交 issue 附日志。
 - 转场暂停顺延时长为固定值（2s），个别场景动画更长时可能被截断。
+- LSPosed 没有供普通模块直接修改用户作用域勾选状态的公开 API；Manifest 的 `xposedscope` 会提供安装时的推荐作用域，最终勾选仍需用户确认。
+
+## AOD 低频动画可行性
+
+原厂全屏 AOD 的壁纸压暗与场景渲染是两条链路：SystemUI 通过 `wallpaperBlack` 调整壁纸合成亮度，而超级壁纸场景由独立的 Filament/Unity 引擎绘制。当前版本在保留主题 AOD 的策略下主动阻断超级壁纸 AOD 事件，并在息屏路径暂停 Filament，因此默认保持静帧。
+
+地球、月球等场景本身具备 `Choreographer`/引擎动画循环，理论上可以在 AOD surface 仍由系统按低刷新率调度时恢复“每次 AOD 帧推进一次”的动画。但这需要同时验证 ROM 是否继续绑定该 wallpaper surface、AOD 的实际刷新回调频率、功耗/烧屏限制，以及各场景在 `AOD` 与 `LOCK` 状态间是否能无跳变恢复。基于当前反编译证据，这部分属于待设备实测的实验功能，本版本不默认开启。
 
 ## 免责声明
 
