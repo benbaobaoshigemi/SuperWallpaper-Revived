@@ -2,6 +2,7 @@ package com.miui.superwallpapernoaod;
 
 import android.content.Context;
 import android.os.Bundle;
+import android.os.Handler;
 import android.provider.Settings;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
@@ -58,6 +59,11 @@ public final class EntryPoint implements IXposedHookLoadPackage {
     // 用该标志识别“正在执行息屏路径”，把 ForceLock（场景侧瞬移）改写为 Lock（摄像机插值动画），
     // 保留桌面->锁屏转场。仅场景包进程、主线程使用，无需同步。
     private static boolean sSleepPath;
+
+    // 桌面->锁屏 Lock 动画时长：月球 Filament 场景 1500ms，雪山 Lua 摄像机插值约 2s 收敛。
+    // 息屏路径原排 300ms 的 MSG_FILAMENT_PAUSE 会在动画中途暂停渲染 -> 顺延到动画结束再暂停，
+    // 这样转场能完整播完，且 AOD 静帧恰好停在锁屏视角；唤醒路径 onWakeUp 会 removeMessages(1) 重新排期。
+    private static final long LOCK_TRANSITION_PAUSE_MS = 2000L;
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) throws Throwable {
@@ -159,6 +165,11 @@ public final class EntryPoint implements IXposedHookLoadPackage {
                 Context.class, boolean.class, float.class, float.class, float.class, float.class, String.class);
         hookVoid(cl, "com.android.thememanager.util.WallpaperUtils",
                 "y9n", "theme:WallpaperUtils.y9n", String[].class);
+        // “自定义”（锁屏时钟编辑器入口）：锁屏/桌面壁纸类型为 super_wallpaper/linkage_video 时，
+        // SettingsMyTemplateViewHolder.bek6() 隐藏“自定义”按钮、SettingsTemplateView.zwy() 吞点击。
+        // 强制 ki=false -> 恢复按钮与点击（副作用：历史模板同样放行，可接受）。
+        hookReturnFalse(cl, "com.miui.keyguard.editor.utils.Wallpaper$Companion",
+                "ki", "theme:Wallpaper.Companion.ki", String.class, String.class);
     }
 
     // ---------- com.miui.miwallpaper (main) ----------
@@ -235,6 +246,7 @@ public final class EntryPoint implements IXposedHookLoadPackage {
                                 if ("ForceLock".equals(param.args[0])) {
                                     param.args[0] = "Lock";
                                     log(pkg + ": sleep ForceLock -> Lock (keep desk->lock transition)");
+                                    rescheduleFilamentPause(param.thisObject);
                                 }
                             }
                         }
@@ -242,6 +254,102 @@ public final class EntryPoint implements IXposedHookLoadPackage {
             log(pkg + ": sendFilamentMessage hooked");
         } catch (Throwable t) {
             logErr(pkg + ": sendFilamentMessage hook failed", t);
+        }
+
+        // 月球场景（com.miui.mrengine.MoonMrePlayer）：场景侧处于 FLOCK 状态时会直接忽略 Lock 事件，
+        // 导致“唤醒未解锁再次息屏”时桌面->锁屏转场完全不播放。
+        // 收到 Lock 时若当前状态是 FLOCK，先重置为 HOME 再放行（从当前锁屏位姿插值到新锁屏位姿）。
+        if ("com.miui.miwallpaper.moon".equals(pkg)) {
+            try {
+                XposedHelpers.findAndHookMethod("com.miui.mrengine.MoonMrePlayer", cl,
+                        "sendMessage", String.class,
+                        new XC_MethodHook() {
+                            @Override
+                            protected void beforeHookedMethod(MethodHookParam param) {
+                                if (!"Lock".equals(param.args[0])) {
+                                    return;
+                                }
+                                try {
+                                    Object state = XposedHelpers.getObjectField(
+                                            param.thisObject, "curMoonState");
+                                    if (state != null && "FLOCK".equals(state.toString())) {
+                                        Object home = XposedHelpers.getStaticObjectField(
+                                                state.getClass(), "HOME");
+                                        XposedHelpers.setObjectField(
+                                                param.thisObject, "curMoonState", home);
+                                        log(pkg + ": moon scene FLOCK -> HOME so Lock transition plays");
+                                    }
+                                } catch (Throwable t) {
+                                    logErr(pkg + ": moon FLOCK reset failed", t);
+                                }
+                            }
+                        });
+                log(pkg + ": MoonMrePlayer.sendMessage hooked");
+            } catch (Throwable t) {
+                logErr(pkg + ": MoonMrePlayer.sendMessage hook failed", t);
+            }
+        }
+
+        // 雪山（整包混淆，无 onGoingToSleep/sendFilamentMessage）适配：
+        // - Android U 息屏走 onCommand goingtosleep 内联分支 -> post j2.f(b!=0) -> r("ForceLock")；
+        // - 旧版广播路径 q() -> post SuperWallpaper$e -> r("ForceLock")。
+        // 两处 run() 前置睡眠标志，r(String) 统一把 ForceLock 改写为 Lock 并顺延暂停。
+        try {
+            XposedHelpers.findAndHookMethod(
+                    "com.miui.miwallpaper.basesuperwallpaper.SuperWallpaper$e", cl,
+                    "run",
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            sSleepPath = true;
+                        }
+                    });
+            log(pkg + ": snowmountain $e.run hooked");
+        } catch (Throwable t) {
+            logErr(pkg + ": snowmountain $e.run hook failed", t);
+        }
+        try {
+            XposedHelpers.findAndHookMethod(
+                    "j2.f", cl,
+                    "run",
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            try {
+                                // b==0 是 keyguardgoingaway 后的 u=false 兜底（不发送），
+                                // b!=0（goingtosleep 传来）才发 ForceLock，避免标志泄漏。
+                                if (XposedHelpers.getIntField(param.thisObject, "b") != 0) {
+                                    sSleepPath = true;
+                                }
+                            } catch (Throwable t) {
+                                logErr(pkg + ": snowmountain j2.f read b failed", t);
+                            }
+                        }
+                    });
+            log(pkg + ": snowmountain j2.f.run hooked");
+        } catch (Throwable t) {
+            logErr(pkg + ": snowmountain j2.f.run hook failed", t);
+        }
+        try {
+            XposedHelpers.findAndHookMethod(
+                    "com.miui.miwallpaper.basesuperwallpaper.SuperWallpaper", cl,
+                    "r", String.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            if (sSleepPath) {
+                                sSleepPath = false;
+                                if ("ForceLock".equals(param.args[0])) {
+                                    param.args[0] = "Lock";
+                                    log(pkg + ": snowmountain sleep ForceLock -> Lock (keep desk->lock transition)");
+                                    rescheduleFilamentPause(param.thisObject);
+                                }
+                            }
+                        }
+                    });
+            log(pkg + ": snowmountain r(String) hooked");
+        } catch (Throwable t) {
+            logErr(pkg + ": snowmountain r(String) hook failed", t);
         }
     }
 
@@ -309,6 +417,26 @@ public final class EntryPoint implements IXposedHookLoadPackage {
         System.arraycopy(parameterTypes, 0, args, 0, parameterTypes.length);
         args[parameterTypes.length] = callback;
         return args;
+    }
+
+    // 把息屏路径排的 MSG_FILAMENT_PAUSE(what=1, 300ms) 顺延到 Lock 动画结束之后，
+    // 避免转场中途被暂停掐断。可读包字段名 mHandler，雪山混淆包为 J。
+    private static void rescheduleFilamentPause(Object superWallpaper) {
+        Object handler = null;
+        try {
+            handler = XposedHelpers.getObjectField(superWallpaper, "mHandler");
+        } catch (Throwable ignored) {
+        }
+        if (handler == null) {
+            try {
+                handler = XposedHelpers.getObjectField(superWallpaper, "J");
+            } catch (Throwable ignored) {
+            }
+        }
+        if (handler instanceof Handler) {
+            ((Handler) handler).removeMessages(1);
+            ((Handler) handler).sendEmptyMessageDelayed(1, LOCK_TRANSITION_PAUSE_MS);
+        }
     }
 
     private static void log(String msg) {
