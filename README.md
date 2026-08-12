@@ -1,4 +1,4 @@
-# SuperWallpaperNoAOD · 超级壁纸保留主题 AOD
+# SuperWallpaper-Revived · 复兴超级壁纸
 
 Xposed / LSPosed 模块：应用小米超级壁纸后，**息屏（AOD）完全交给主题 / 息屏应用**，超级壁纸引擎不再接管 AOD 动画与时钟；同时修复「桌面 → 锁屏」转场，并保证「锁屏 → AOD」不刷新场景样式。
 
