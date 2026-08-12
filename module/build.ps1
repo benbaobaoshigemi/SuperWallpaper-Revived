@@ -1,14 +1,52 @@
-﻿param(
+# Build script for the Xposed module.
+# Requirements: JDK 17, Android SDK (build-tools + platform android-36), PowerShell.
+# Tool discovery order: ANDROID_HOME / ANDROID_SDK_ROOT -> %LOCALAPPDATA%\Android\Sdk
+#                       JAVA_HOME -> common Adoptium install path
+param(
     [string]$OutApk = ""
 )
 $ErrorActionPreference = "Stop"
-$base = "G:\超级壁纸\SuperWallpaperNoAOD"
-$sdk  = "$env:LOCALAPPDATA\Android\Sdk"
-$bt   = "$sdk\build-tools\36.1.0"
-$plat = "$sdk\platforms\android-36\android.jar"
-$javac = "C:\Program Files\Eclipse Adoptium\jdk-17.0.16.8-hotspot\bin\javac.exe"
-$jar   = "C:\Program Files\Eclipse Adoptium\jdk-17.0.16.8-hotspot\bin\jar.exe"
-$keytool = "C:\Program Files\Eclipse Adoptium\jdk-17.0.16.8-hotspot\bin\keytool.exe"
+$base = $PSScriptRoot
+
+# ---- SDK / platform / build-tools discovery ----
+if ($env:ANDROID_HOME) {
+    $sdk = $env:ANDROID_HOME
+} elseif ($env:ANDROID_SDK_ROOT) {
+    $sdk = $env:ANDROID_SDK_ROOT
+} elseif (Test-Path "$env:LOCALAPPDATA\Android\Sdk") {
+    $sdk = "$env:LOCALAPPDATA\Android\Sdk"
+} else {
+    throw "Android SDK not found. Set ANDROID_HOME / ANDROID_SDK_ROOT first."
+}
+$bt = Get-ChildItem "$sdk\build-tools" -Directory -ErrorAction Stop |
+    Sort-Object { [version]$_.Name } -Descending | Select-Object -First 1
+if (-not $bt) { throw "No build-tools found under $sdk\build-tools" }
+$bt = $bt.FullName
+$plat = Get-ChildItem "$sdk\platforms" -Directory -Filter "android-*" -ErrorAction Stop |
+    Sort-Object { [int]$_.Name.Replace('android-', '') } -Descending | Select-Object -First 1
+if (-not $plat) { throw "No platform found under $sdk\platforms" }
+$plat = Join-Path $plat.FullName "android.jar"
+
+# ---- JDK discovery ----
+$jdkRoot = $env:JAVA_HOME
+if (-not $jdkRoot -or -not (Test-Path "$jdkRoot\bin\javac.exe")) {
+    $candidates = @(
+        "C:\Program Files\Eclipse Adoptium",
+        "C:\Program Files\Java",
+        "C:\Program Files\Microsoft"
+    )
+    foreach ($c in $candidates) {
+        $found = Get-ChildItem $c -Directory -Filter "*17*" -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if ($found) { $jdkRoot = $found.FullName; break }
+    }
+}
+if (-not $jdkRoot -or -not (Test-Path "$jdkRoot\bin\javac.exe")) {
+    throw "JDK not found. Set JAVA_HOME first."
+}
+$javac   = "$jdkRoot\bin\javac.exe"
+$jar     = "$jdkRoot\bin\jar.exe"
+$keytool = "$jdkRoot\bin\keytool.exe"
 $api = "$base\libs\xposed-api-82.jar"
 
 $cls = "$base\build\classes"
@@ -28,7 +66,8 @@ if ($LASTEXITCODE -ne 0) { throw "d8 failed" }
 Write-Output "== aapt2 =="
 $resZip = "$base\build\res.zip"
 $unsigned = "$base\build\unsigned.apk"
-# aapt2 在含非 ASCII 字符的绝对路径上会打开目录失败（Windows 编码 bug），改用项目内相对路径
+# aapt2 cannot open directories whose absolute path contains non-ASCII characters
+# (Windows encoding bug), so run it with a relative path from the module dir.
 Push-Location $base
 try {
     & "$bt\aapt2.exe" compile --dir "res" -o "build\res.zip" 2>&1
@@ -54,7 +93,8 @@ if ($LASTEXITCODE -ne 0) { throw "zipalign failed" }
 Write-Output "== sign =="
 $ks = "$base\build\debug.keystore"
 if (-not (Test-Path $ks)) {
-    # keytool 把进度信息写到 stderr，Stop 下会误判为错误 -> 临时降级并检查退出码
+    # keytool prints progress to stderr, which trips $ErrorActionPreference=Stop;
+    # temporarily downgrade and check the exit code explicitly.
     $oldEap = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     & $keytool -genkeypair -keystore $ks -storepass android -alias androiddebugkey -keypass android -dname "CN=Android Debug,O=Android,C=US" -keyalg RSA -keysize 2048 -validity 10000 2>&1 | Out-Null

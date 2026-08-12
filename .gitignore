@@ -1,10 +1,24 @@
 # 构建产物（可再生）
-SuperWallpaperNoAOD/build/
+module/build/
+module/*.apk
+module/*.apk.idsig
+*.idsig
 
-# 大体积/可再生二进制：设备拉取与反编译产物
+# 大体积 / 可再生二进制
 *.apk
 *.dex
 
-# jadx 反编译输出（可再生，文件量大）
-_analysis/jadx-out/
-_analysis/*_dex/
+# 设备拉取与反编译分析产物（专有软件，不随源码分发）
+pulled/
+_analysis/
+_extract/
+lspd_check/
+lspd_check2/
+lspd_*/**/*.db
+*.db
+
+# 本地临时文件
+*.javap.txt
+_apply_test.txt
+_patch.txt
+lsposed-manager.apk

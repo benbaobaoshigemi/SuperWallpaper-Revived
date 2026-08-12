@@ -9,5 +9,7 @@
         <item>com.miui.miwallpaper.snowmountain</item>
         <item>com.miui.miwallpaper.geometry</item>
         <item>com.android.thememanager</item>
+        <item>com.miui.aod</item>
+        <item>com.android.systemui</item>
     </string-array>
 </resources>
