@@ -32,6 +32,8 @@ public final class ModuleSettingsProvider extends ContentProvider {
                 preferences.getBoolean(ModuleSettings.KEY_CONTINUE_AOD_ROTATION, false));
         values.putBoolean(ModuleSettings.KEY_APP_TRANSITION_ZOOM,
                 preferences.getBoolean(ModuleSettings.KEY_APP_TRANSITION_ZOOM, true));
+        values.putBoolean(ModuleSettings.KEY_FORCE_FULL_AOD,
+                preferences.getBoolean(ModuleSettings.KEY_FORCE_FULL_AOD, true));
         return values;
     }
 

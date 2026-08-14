@@ -22,10 +22,12 @@ final class ModuleSettings {
     static final String KEY_REUSE_OEM_FULL_AOD_DIMMING = "reuse_oem_full_aod_dimming";
     static final String KEY_CONTINUE_AOD_ROTATION = "continue_aod_rotation";
     static final String KEY_APP_TRANSITION_ZOOM = "app_transition_zoom";
+    static final String KEY_FORCE_FULL_AOD = "force_full_aod";
     private static final String SECURE_DISABLE_AOD_LOCK_ZOOM = "sw_noaod_disable_aod_lock_zoom";
     private static final String SECURE_REUSE_OEM_FULL_AOD_DIMMING = "sw_noaod_reuse_oem_full_aod_dimming";
     private static final String SECURE_CONTINUE_AOD_ROTATION = "sw_noaod_continue_aod_rotation";
     private static final String SECURE_APP_TRANSITION_ZOOM = "sw_noaod_app_transition_zoom";
+    private static final String SECURE_FORCE_FULL_AOD = "sw_noaod_force_full_aod";
     static final String PROVIDER_AUTHORITY = PACKAGE_NAME + ".settings";
     static final Uri PROVIDER_URI = Uri.parse("content://" + PROVIDER_AUTHORITY);
 
@@ -34,6 +36,7 @@ final class ModuleSettings {
     private static boolean reuseOemFullAodDimming = true;
     private static boolean continueAodRotation;
     private static boolean appTransitionZoom = true;
+    private static boolean forceFullAod = true;
     private static long loadedAt;
     private static final long CACHE_TTL_MS = 1000L;
     private static boolean observerRegistered;
@@ -65,6 +68,12 @@ final class ModuleSettings {
         return appTransitionZoom;
     }
 
+    static boolean forceFullAod() {
+        refreshSecureValue(4);
+        loadFromProvider();
+        return forceFullAod;
+    }
+
     private static void refreshSecureValue(int which) {
         Context context = AndroidAppHelper.currentApplication();
         if (context == null) {
@@ -78,8 +87,10 @@ final class ModuleSettings {
                 key = SECURE_REUSE_OEM_FULL_AOD_DIMMING;
             } else if (which == 2) {
                 key = SECURE_CONTINUE_AOD_ROTATION;
-            } else {
+            } else if (which == 3) {
                 key = SECURE_APP_TRANSITION_ZOOM;
+            } else {
+                key = SECURE_FORCE_FULL_AOD;
             }
             int value = Settings.Secure.getInt(context.getContentResolver(), key, Integer.MIN_VALUE);
             if (value == Integer.MIN_VALUE) {
@@ -92,8 +103,10 @@ final class ModuleSettings {
                     reuseOemFullAodDimming = value != 0;
                 } else if (which == 2) {
                     continueAodRotation = value != 0;
-                } else {
+                } else if (which == 3) {
                     appTransitionZoom = value != 0;
+                } else {
+                    forceFullAod = value != 0;
                 }
                 loaded = true;
                 loadedAt = SystemClock.elapsedRealtime();
@@ -125,12 +138,16 @@ final class ModuleSettings {
                     SECURE_CONTINUE_AOD_ROTATION, Integer.MIN_VALUE);
             int appZoom = Settings.Secure.getInt(context.getContentResolver(),
                     SECURE_APP_TRANSITION_ZOOM, Integer.MIN_VALUE);
+            int fullAod = Settings.Secure.getInt(context.getContentResolver(),
+                    SECURE_FORCE_FULL_AOD, Integer.MIN_VALUE);
             if (disable != Integer.MIN_VALUE && dimming != Integer.MIN_VALUE
-                    && rotation != Integer.MIN_VALUE && appZoom != Integer.MIN_VALUE) {
+                    && rotation != Integer.MIN_VALUE && appZoom != Integer.MIN_VALUE
+                    && fullAod != Integer.MIN_VALUE) {
                 disableAodToLockZoom = disable != 0;
                 reuseOemFullAodDimming = dimming != 0;
                 continueAodRotation = rotation != 0;
                 appTransitionZoom = appZoom != 0;
+                forceFullAod = fullAod != 0;
             } else {
                 Bundle values = context.getContentResolver().call(PROVIDER_URI,
                         ModuleSettingsProvider.METHOD_GET_SETTINGS, null, null);
@@ -141,6 +158,7 @@ final class ModuleSettings {
                 reuseOemFullAodDimming = values.getBoolean(KEY_REUSE_OEM_FULL_AOD_DIMMING, true);
                 continueAodRotation = values.getBoolean(KEY_CONTINUE_AOD_ROTATION, false);
                 appTransitionZoom = values.getBoolean(KEY_APP_TRANSITION_ZOOM, true);
+                forceFullAod = values.getBoolean(KEY_FORCE_FULL_AOD, true);
             }
             loaded = true;
             loadedAt = SystemClock.elapsedRealtime();
@@ -154,7 +172,8 @@ final class ModuleSettings {
             Log.i("SWNoAOD", "settings refreshed pid=" + Process.myPid()
                     + " disableZoom=" + disableAodToLockZoom
                     + " reuseDimming=" + reuseOemFullAodDimming
-                    + " continueRotation=" + continueAodRotation);
+                    + " continueRotation=" + continueAodRotation
+                    + " forceFullAod=" + forceFullAod);
         } catch (Exception e) {
             // SystemUI can call this before the module provider is available. Retry next time.
             Log.w("SWNoAOD", "settings refresh failed pid=" + Process.myPid(), e);
@@ -182,6 +201,8 @@ final class ModuleSettings {
                 Settings.Secure.getUriFor(SECURE_CONTINUE_AOD_ROTATION), false, observer);
         context.getContentResolver().registerContentObserver(
                 Settings.Secure.getUriFor(SECURE_APP_TRANSITION_ZOOM), false, observer);
+        context.getContentResolver().registerContentObserver(
+                Settings.Secure.getUriFor(SECURE_FORCE_FULL_AOD), false, observer);
         observerRegistered = true;
     }
 
@@ -201,7 +222,9 @@ final class ModuleSettings {
                 + "; settings put secure " + SECURE_CONTINUE_AOD_ROTATION + " "
                 + boolValue(preferences.getBoolean(KEY_CONTINUE_AOD_ROTATION, false))
                 + "; settings put secure " + SECURE_APP_TRANSITION_ZOOM + " "
-                + boolValue(preferences.getBoolean(KEY_APP_TRANSITION_ZOOM, true));
+                + boolValue(preferences.getBoolean(KEY_APP_TRANSITION_ZOOM, true))
+                + "; settings put secure " + SECURE_FORCE_FULL_AOD + " "
+                + boolValue(preferences.getBoolean(KEY_FORCE_FULL_AOD, true));
         executeSecureCommand(command, "all settings");
     }
 
@@ -215,6 +238,8 @@ final class ModuleSettings {
             secureKey = SECURE_CONTINUE_AOD_ROTATION;
         } else if (KEY_APP_TRANSITION_ZOOM.equals(key)) {
             secureKey = SECURE_APP_TRANSITION_ZOOM;
+        } else if (KEY_FORCE_FULL_AOD.equals(key)) {
+            secureKey = SECURE_FORCE_FULL_AOD;
         } else {
             return;
         }

@@ -67,6 +67,9 @@ private fun SettingsScreen(activity: Activity) {
     var appTransitionZoom by remember {
         mutableStateOf(preferences.getBoolean(ModuleSettings.KEY_APP_TRANSITION_ZOOM, true))
     }
+    var forceFullAod by remember {
+        mutableStateOf(preferences.getBoolean(ModuleSettings.KEY_FORCE_FULL_AOD, true))
+    }
     var status by remember { mutableStateOf("") }
 
     MiuixTheme {
@@ -94,6 +97,15 @@ private fun SettingsScreen(activity: Activity) {
                             onCheckedChange = {
                                 disableZoom = it
                                 ModuleSettings.save(activity, ModuleSettings.KEY_DISABLE_AOD_LOCK_ZOOM, it)
+                            },
+                        )
+                        SwitchPreference(
+                            title = "强制启用全屏AOD",
+                            summary = "仅绕过机型能力限制；超级壁纸兼容始终保持开启",
+                            checked = forceFullAod,
+                            onCheckedChange = {
+                                forceFullAod = it
+                                ModuleSettings.save(activity, ModuleSettings.KEY_FORCE_FULL_AOD, it)
                             },
                         )
                         SwitchPreference(

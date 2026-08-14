@@ -11,8 +11,8 @@ android {
         applicationId = "com.miui.superwallpapernoaod"
         minSdk = 26
         targetSdk = 36
-        versionCode = 6
-        versionName = "1.3.2"
+        versionCode = 8
+        versionName = "1.4.1"
     }
 
     buildFeatures {

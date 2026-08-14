@@ -122,8 +122,7 @@ public final class EntryPoint implements IXposedHookLoadPackage {
                     "com.miui.home.recents.anim.SystemWallpaperElement", cl);
             Class<?> wallpaperParam = XposedHelpers.findClass(
                     "com.miui.home.recents.anim.WallpaperParam", cl);
-            XposedHelpers.findAndHookMethod(wallpaperElement, "animTo", wallpaperParam,
-                    new XC_MethodHook() {
+            XC_MethodHook wallpaperZoomHook = new XC_MethodHook() {
                         @Override
                         protected void beforeHookedMethod(MethodHookParam param) {
                             if (!ModuleSettings.appTransitionZoom()) {
@@ -131,12 +130,18 @@ public final class EntryPoint implements IXposedHookLoadPackage {
                                 return;
                             }
                             float zoom = XposedHelpers.getFloatField(param.args[0], "zoomOut");
-                            int state = Math.abs(zoom - 1.1969999f) < 0.01f ? 1
-                                    : Math.abs(zoom - 1.05f) < 0.01f ? 2 : 0;
+                            int state = zoom > 1.10f ? 1 : zoom <= 1.06f ? 2 : 0;
                             if (state == 0 || state == sLauncherWallpaperZoomState) return;
                             Activity activity = sLauncherActivity;
                             IBinder token = sLauncherWindowToken;
                             if (activity == null || token == null) return;
+                            PowerManager powerManager = activity.getSystemService(PowerManager.class);
+                            KeyguardManager keyguardManager = activity.getSystemService(KeyguardManager.class);
+                            if (powerManager == null || !powerManager.isInteractive()
+                                    || (keyguardManager != null && keyguardManager.isKeyguardLocked())) {
+                                sLauncherWallpaperZoomState = 0;
+                                return;
+                            }
                             String action = state == 1
                                     ? "action_open_folder" : "action_close_folder";
                             try {
@@ -148,7 +153,11 @@ public final class EntryPoint implements IXposedHookLoadPackage {
                                 logErr("launcher: OEM wallpaper zoom command failed", t);
                             }
                         }
-                    });
+                    };
+            XposedHelpers.findAndHookMethod(wallpaperElement, "animTo", wallpaperParam,
+                    wallpaperZoomHook);
+            XposedHelpers.findAndHookMethod(wallpaperElement, "setTo", wallpaperParam,
+                    wallpaperZoomHook);
             Class<?> launcherClass = XposedHelpers.findClass("com.miui.home.launcher.Launcher", cl);
             XposedHelpers.findAndHookMethod(Activity.class, "onResume", new XC_MethodHook() {
                 @Override
@@ -169,7 +178,8 @@ public final class EntryPoint implements IXposedHookLoadPackage {
 
     private void hookAodApp(ClassLoader cl) {
         // 设备能力门：aurora 上 SUPPORT_FULL_AOD=false 导致“息屏样式”容器被隐藏
-        hookReturnTrue(cl, "com.miui.aod.Utils", "isSupportFsAod", "aod:isSupportFsAod");
+        hookReturnTrueWhenForceFullAod(cl, "com.miui.aod.Utils", "isSupportFsAod",
+                "aod:isSupportFsAod");
         // 支持门：锁屏被超级壁纸占用后 full_screen_aod_support 可能为 0，下拉会被禁用/拒绝
         hookReturnTrue(cl, "com.miui.aod.Utils", "isFullAodSupport", "aod:isFullAodSupport",
                 Context.class);
@@ -198,6 +208,10 @@ public final class EntryPoint implements IXposedHookLoadPackage {
                     new XC_MethodHook() {
                         @Override
                         protected void beforeHookedMethod(MethodHookParam param) {
+                            if (!ModuleSettings.forceFullAod()) {
+                                log("sysui: force full AOD disabled; keep OEM capability");
+                                return;
+                            }
                             try {
                                 Class<?> configs = XposedHelpers.findClass(
                                         "com.miui.utils.configs.MiuiConfigs", cl);
@@ -867,6 +881,25 @@ public final class EntryPoint implements IXposedHookLoadPackage {
                         }
                     }));
             log(tag + ": hooked -> forced true");
+        } catch (Throwable t) {
+            logErr(tag + ": hook failed", t);
+        }
+    }
+
+    private void hookReturnTrueWhenForceFullAod(ClassLoader cl, String className,
+                                                String methodName, String tag,
+                                                Class<?>... parameterTypes) {
+        try {
+            XposedHelpers.findAndHookMethod(className, cl, methodName,
+                    callbackArgs(parameterTypes, new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            if (ModuleSettings.forceFullAod()) {
+                                param.setResult(true);
+                            }
+                        }
+                    }));
+            log(tag + ": hooked -> controlled by force full AOD setting");
         } catch (Throwable t) {
             logErr(tag + ": hook failed", t);
         }
