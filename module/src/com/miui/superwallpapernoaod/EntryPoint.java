@@ -8,7 +8,9 @@ import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.IBinder;
+import android.os.Looper;
 import android.os.PowerManager;
+import android.os.SystemClock;
 import android.provider.Settings;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
@@ -48,6 +50,9 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  *   导致“桌面->锁屏”失去转场动画 -> hook 后按引擎状态改写：从桌面息屏改发 Lock（场景侧摄像机
  *   插值动画，动画结束停在锁屏视角，作为全屏AOD“和锁屏样式一致”的静帧背景）；
  *   从锁屏息屏（锁屏->AOD）则丢弃 ForceLock，保持当前静帧不刷新样式（样式变化只允许从桌面出发）。
+ * - “经典超级壁纸AOD”开启时，从桌面进入全屏 AOD 会在一次 onGoingToSleep 调用内放行原厂
+ *   AOD 样式判断和入口，恢复 AOD 样式轮换与原生动画；唤醒后发送 Lock 返回锁屏构图。
+ *   锁屏->AOD 不进入该分支。
  * - Filament 系（earth/moon）走 sendFilamentMessage，Unity 系（mars/saturn/geometry）走
  *   sendUnityMessage，统一按同一规则改写。锁屏->桌面（Desk 事件）不受影响。
  */
@@ -70,10 +75,31 @@ public final class EntryPoint implements IXposedHookLoadPackage {
     // 息屏瞬间引擎所处的壁纸状态（mWallpaperState）：true=从桌面息屏（发 Lock 保留转场）；
     // false=从锁屏息屏即锁屏->AOD（丢弃 ForceLock，保持当前静帧不刷新样式）。
     private static boolean sSleepFromDesk;
+    private static boolean sForceClassicAodStyle;
+    private static boolean sClassicAodPending;
+    private static boolean sClassicAodActive;
+    private static boolean sRestoreLockOnWake;
     // 实验性：尽量放行所有可 Hook 到的场景渲染暂停，包括 AOD/Doze。
     private static boolean sContinueAodRotation;
     // AOD 唤醒回锁屏期间吞掉所有 Lock/ForceLock，直到进入桌面，保留最终静止构图。
     private static boolean sSuppressWakeLockEvent;
+    private static long sEarlySleepLockUptime;
+    private static boolean sReplayingDelayedScreenFade;
+    private static int sDesktopFollowScalePercent = 100;
+    private static int sDesktopFollowDampingPercent = 100;
+    private static int sDesktopFollowResponsePercent = 100;
+    private static long sDesktopFollowSettingsLoadedAt;
+    private static final DesktopFollowSpring sDesktopFollowSpring = new DesktopFollowSpring();
+    private static final ThreadLocal<Boolean> sDispatchingDesktopFollow = new ThreadLocal<>();
+    private static Handler sDesktopFollowHandler;
+    private static Object sDesktopFollowTarget;
+    private static String sDesktopFollowMethodName;
+    private static final Runnable sDesktopFollowContinuation =
+            EntryPoint::continueDesktopFollow;
+
+    private static final long EARLY_LOCK_DEDUP_WINDOW_MS = 3000L;
+    private static final long NON_FULLSCREEN_AOD_HEAD_START_MS = 250L;
+    private static final long CLASSIC_AOD_WAKE_FALLBACK_MS = 100L;
 
     // 设置页模板信息 ContentObserver 窗口标志：编辑页保存样式后写
     // Settings.Secure["constant_template_editor_info"]，设置页
@@ -109,6 +135,14 @@ public final class EntryPoint implements IXposedHookLoadPackage {
         } else {
             for (String scene : SCENE_PACKAGES) {
                 if (scene.equals(pkg)) {
+                    if ("com.miui.miwallpaper.saturn".equals(pkg)) {
+                        try {
+                            System.loadLibrary("saturnstyle");
+                            log(pkg + ": native lock style hook loaded");
+                        } catch (Throwable t) {
+                            logErr(pkg + ": native lock style hook load failed", t);
+                        }
+                    }
                     hookScene(cl, pkg);
                     break;
                 }
@@ -341,7 +375,87 @@ public final class EntryPoint implements IXposedHookLoadPackage {
         } catch (Throwable t) {
             logErr("sysui: calculateWallpaperMatrixArray hook failed", t);
         }
+        hookNonFullscreenAodTransition(cl);
     }
+
+
+    private void hookNonFullscreenAodTransition(ClassLoader cl) {
+        try {
+            XposedHelpers.findAndHookMethod(
+                    "com.android.keyguard.screenfade.DisplayStateShaderController"
+                            + "$updateScreenFadeState$1",
+                    cl, "run", new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            try {
+                                if (XposedHelpers.getBooleanField(param.thisObject, "$wakeup")) {
+                                    return;
+                                }
+                                if (sReplayingDelayedScreenFade) {
+                                    return;
+                                }
+                                if (!ModuleSettings.nonFullscreenAodTransition()) {
+                                    return;
+                                }
+                                Object fadeController = XposedHelpers.getObjectField(
+                                        param.thisObject, "this$0");
+                                Object injector = XposedHelpers.getObjectField(
+                                        fadeController, "mKeyguardPanelViewInjector");
+                                Object panel = XposedHelpers.callMethod(
+                                        injector, "getKeyguardPanelViewController");
+                                Context context = (Context) XposedHelpers.getObjectField(
+                                        fadeController, "mContext");
+                                if (Settings.Secure.getInt(context.getContentResolver(),
+                                        "full_screen_aod_on", 0) != 0) {
+                                    return;
+                                }
+                                Class<?> commonUtil = XposedHelpers.findClass(
+                                        "com.miui.systemui.util.CommonUtil", cl);
+                                if (!"super_wallpaper".equals(XposedHelpers.getStaticObjectField(
+                                        commonUtil, "sKeyguardWallpaperType"))) {
+                                    return;
+                                }
+                                if (!(Boolean) XposedHelpers.callStaticMethod(
+                                        commonUtil, "isTopActivityLauncher", context)) {
+                                    return;
+                                }
+                                Object rootView = XposedHelpers.getObjectField(
+                                        panel, "keyguardRootView");
+                                IBinder token = (IBinder) XposedHelpers.callMethod(
+                                        rootView, "getWindowToken");
+                                if (token == null) {
+                                    return;
+                                }
+                                WallpaperManager.getInstance(context).sendWallpaperCommand(
+                                        token, "action_lock", 0, 0, 0, null);
+                                Handler handler = (Handler) XposedHelpers.getObjectField(
+                                        fadeController, "mScreenFadeHandler");
+                                Object delayedRun = param.thisObject;
+                                handler.postDelayed(() -> {
+                                    sReplayingDelayedScreenFade = true;
+                                    try {
+                                        XposedHelpers.callMethod(delayedRun, "run");
+                                    } catch (Throwable t) {
+                                        logErr("sysui: delayed ScreenFade run failed", t);
+                                    } finally {
+                                        sReplayingDelayedScreenFade = false;
+                                    }
+                                }, NON_FULLSCREEN_AOD_HEAD_START_MS);
+                                log("sysui: non-fullscreen AOD Lock sent; ScreenFade delayed "
+                                        + NON_FULLSCREEN_AOD_HEAD_START_MS + "ms");
+                                param.setResult(null);
+                            } catch (Throwable t) {
+                                logErr("sysui: non-fullscreen AOD transition failed", t);
+                            }
+                        }
+                    });
+            log("sysui: non-fullscreen AOD transition hooked");
+        } catch (Throwable t) {
+            logErr("sysui: non-fullscreen AOD transition hook failed", t);
+        }
+    }
+
+
 
     // ---------- com.android.thememanager ----------
 
@@ -371,16 +485,16 @@ public final class EntryPoint implements IXposedHookLoadPackage {
 
     private void hookScene(ClassLoader cl, String pkg) {
         // 门：永不承认正在使用超级壁纸AOD样式（覆盖 Filament 系：earth/moon 与 Unity 系：mars/saturn/geometry）
-        hookReturnFalse(cl, "com.miui.miwallpaper.baselib.utils.AodUtils",
-                "isAodUsingSuperWallpaperStyle", pkg + ":isAodUsingSuperWallpaperStyle", Context.class);
+        hookSceneAodStyleGate(cl, pkg);
         // 门：雪山包混淆类 i2.a.b
         hookReturnFalse(cl, "i2.a", "b", pkg + ":i2.a.b", Context.class);
 
         // 入口：AOD 状态进入方法（存在即阻断，不存在的场景包静默跳过）
-        hookVoid(cl, "com.miui.miwallpaper.basesuperwallpaper.SuperWallpaper$SuperWallpaperEngine",
-                "goToAodState", pkg + ":goToAodState", int.class);
-        hookVoid(cl, "com.miui.miwallpaper.basesuperwallpaper.SuperWallpaper",
-                "gotoAod", pkg + ":gotoAod", int.class);
+        hookSceneAodEntryGate(cl, pkg,
+                "com.miui.miwallpaper.basesuperwallpaper.SuperWallpaper$SuperWallpaperEngine",
+                "goToAodState");
+        hookSceneAodEntryGate(cl, pkg,
+                "com.miui.miwallpaper.basesuperwallpaper.SuperWallpaper", "gotoAod");
         hookVoid(cl, "com.miui.miwallpaper.basesuperwallpaper.SuperWallpaper",
                 "o", pkg + ":SuperWallpaper.o(AOD)", int.class);
 
@@ -438,6 +552,34 @@ public final class EntryPoint implements IXposedHookLoadPackage {
                             }
                             log(pkg + ": onGoingToSleep fromDesk=" + sSleepFromDesk
                                     + " aodFinitePlayback=" + sContinueAodRotation);
+                            sForceClassicAodStyle = false;
+                            if (sSleepFromDesk
+                                    && ModuleSettings.classicSuperWallpaperAod()) {
+                                sClassicAodPending = false;
+                                sClassicAodActive = false;
+                                try {
+                                    Object service = XposedHelpers.getObjectField(
+                                            param.thisObject, "this$0");
+                                    Context context = (Context) service;
+                                    if (Settings.Secure.getInt(context.getContentResolver(),
+                                            "full_screen_aod_on", 0) != 0) {
+                                        sForceClassicAodStyle = true;
+                                        log(pkg + ": desktop full-AOD -> enable OEM AOD style path");
+                                    }
+                                } catch (Throwable t) {
+                                    logErr(pkg + ": desktop full-AOD style gate failed", t);
+                                }
+                            }
+                        }
+
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            if (sForceClassicAodStyle) {
+                                sForceClassicAodStyle = false;
+                                if (sClassicAodActive) {
+                                    sSleepPath = false;
+                                }
+                            }
                         }
                     });
             log(pkg + ": onGoingToSleep hooked");
@@ -446,6 +588,8 @@ public final class EntryPoint implements IXposedHookLoadPackage {
         }
         hookSleepLockRewrite(cl, pkg, "sendFilamentMessage");
         hookSleepLockRewrite(cl, pkg, "sendUnityMessage");
+        hookDesktopFollowControls(cl, pkg, "sendFilamentMessage");
+        hookDesktopFollowControls(cl, pkg, "sendUnityMessage");
         hookSceneRotationLifecycle(cl, pkg);
         hookVisibilityPauseGate(cl, pkg);
         hookRendererPause(cl, pkg, "unityPause");
@@ -576,6 +720,14 @@ public final class EntryPoint implements IXposedHookLoadPackage {
                     new XC_MethodHook() {
                         @Override
                         protected void beforeHookedMethod(MethodHookParam param) {
+                            if (sRestoreLockOnWake
+                                    && ("ForceLock".equals(param.args[0])
+                                    || "Lock".equals(param.args[0]))) {
+                                sRestoreLockOnWake = false;
+                                param.args[0] = "Lock";
+                                log(pkg + ": classic AOD wake event -> Lock");
+                                return;
+                            }
                             if (sSuppressWakeLockEvent
                                     && ("ForceLock".equals(param.args[0])
                                     || "Lock".equals(param.args[0]))
@@ -585,11 +737,24 @@ public final class EntryPoint implements IXposedHookLoadPackage {
                                 param.setResult(null);
                                 return;
                             }
+                            if ("Lock".equals(param.args[0]) && !sSleepPath
+                                    && ModuleSettings.nonFullscreenAodTransition()) {
+                                sEarlySleepLockUptime = SystemClock.elapsedRealtime();
+                                log(pkg + ": early non-fullscreen AOD Lock received");
+                            }
                             if (sSleepPath) {
                                 sSleepPath = false;
                                 sContinueAodRotation = ModuleSettings.continueAodRotation();
                                 sSuppressWakeLockEvent = false;
                                 if ("ForceLock".equals(param.args[0])) {
+                                    if (sEarlySleepLockUptime != 0L
+                                            && SystemClock.elapsedRealtime()
+                                            - sEarlySleepLockUptime < EARLY_LOCK_DEDUP_WINDOW_MS) {
+                                        sEarlySleepLockUptime = 0L;
+                                        log(pkg + ": snowmountain duplicate sleep ForceLock skipped");
+                                        param.setResult(null);
+                                        return;
+                                    }
                                     param.args[0] = "Lock";
                                     log(pkg + ": snowmountain sleep ForceLock -> Lock (OEM pause lifecycle)");
                                     if (sContinueAodRotation) {
@@ -603,6 +768,50 @@ public final class EntryPoint implements IXposedHookLoadPackage {
         } catch (Throwable t) {
             logErr(pkg + ": snowmountain r(String) hook failed", t);
         }
+        hookDesktopFollowControls(cl, pkg, "r");
+    }
+
+    private void hookSceneAodStyleGate(ClassLoader cl, String pkg) {
+        try {
+            XposedHelpers.findAndHookMethod(
+                    "com.miui.miwallpaper.baselib.utils.AodUtils", cl,
+                    "isAodUsingSuperWallpaperStyle", Context.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            boolean allow = sForceClassicAodStyle;
+                            if (allow) {
+                                log(pkg + ": OEM AOD style check allowed for desktop full-AOD");
+                            }
+                            param.setResult(allow);
+                        }
+                    });
+            log(pkg + ": scene AOD style gate hooked");
+        } catch (Throwable t) {
+            logErr(pkg + ": scene AOD style gate hook failed", t);
+        }
+    }
+
+    private void hookSceneAodEntryGate(
+            ClassLoader cl, String pkg, String className, String methodName) {
+        try {
+            XposedHelpers.findAndHookMethod(className, cl, methodName, int.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            if (sForceClassicAodStyle) {
+                                sClassicAodPending = true;
+                                log(pkg + ": " + methodName
+                                        + " allowed for desktop full-AOD");
+                                return;
+                            }
+                            param.setResult(null);
+                        }
+                    });
+            log(pkg + ": " + methodName + " AOD entry gate hooked");
+        } catch (Throwable ignored) {
+            // Scene engines expose only the AOD entry method used by that engine version.
+        }
     }
 
     // 息屏路径消息改写：桌面->锁屏保留 Lock 转场；实验开启时，锁屏->AOD
@@ -615,6 +824,22 @@ public final class EntryPoint implements IXposedHookLoadPackage {
                     new XC_MethodHook() {
                         @Override
                         protected void beforeHookedMethod(MethodHookParam param) {
+                            if (sClassicAodPending
+                                    && param.args[0] instanceof String
+                                    && ((String) param.args[0]).startsWith("AOD_")) {
+                                sClassicAodPending = false;
+                                sClassicAodActive = true;
+                                sSleepPath = false;
+                                log(pkg + ": classic AOD scene activated by " + param.args[0]);
+                            }
+                            if (sRestoreLockOnWake
+                                    && ("ForceLock".equals(param.args[0])
+                                    || "Lock".equals(param.args[0]))) {
+                                sRestoreLockOnWake = false;
+                                param.args[0] = "Lock";
+                                log(pkg + ": classic AOD wake event -> Lock");
+                                return;
+                            }
                             if (sSuppressWakeLockEvent
                                     && ("ForceLock".equals(param.args[0])
                                     || "Lock".equals(param.args[0]))
@@ -624,10 +849,26 @@ public final class EntryPoint implements IXposedHookLoadPackage {
                                 param.setResult(null);
                                 return;
                             }
+                            if ("Lock".equals(param.args[0]) && !sSleepPath
+                                    && ModuleSettings.nonFullscreenAodTransition()) {
+                                sEarlySleepLockUptime = SystemClock.elapsedRealtime();
+                                log(pkg + ": early non-fullscreen AOD Lock received");
+                                return;
+                            }
                             if (!sSleepPath || !"ForceLock".equals(param.args[0])) {
                                 return;
                             }
                             sSleepPath = false;
+                            sClassicAodPending = false;
+                            if (sEarlySleepLockUptime != 0L
+                                    && SystemClock.elapsedRealtime() - sEarlySleepLockUptime
+                                    < EARLY_LOCK_DEDUP_WINDOW_MS) {
+                                sEarlySleepLockUptime = 0L;
+                                log(pkg + ": duplicate sleep " + methodName
+                                        + " ForceLock skipped");
+                                param.setResult(null);
+                                return;
+                            }
                             if (sSleepFromDesk) {
                                 param.args[0] = "Lock";
                                 log(pkg + ": sleep(desk) " + methodName
@@ -643,10 +884,128 @@ public final class EntryPoint implements IXposedHookLoadPackage {
                                 param.setResult(null);
                             }
                         }
+
                     });
             log(pkg + ": " + methodName + " hooked");
         } catch (Throwable t) {
             logErr(pkg + ": " + methodName + " hook failed", t);
+        }
+    }
+
+    private void hookDesktopFollowControls(ClassLoader cl, String pkg, String methodName) {
+        try {
+            XposedHelpers.findAndHookMethod(
+                    "com.miui.miwallpaper.basesuperwallpaper.SuperWallpaper", cl,
+                    methodName, String.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            if (Boolean.TRUE.equals(sDispatchingDesktopFollow.get())
+                                    || !(param.args[0] instanceof String)) {
+                                return;
+                            }
+                            String event = (String) param.args[0];
+                            if (!event.startsWith("Offset_")) {
+                                if ("Desk".equals(event) || "Lock".equals(event)
+                                        || "ForceLock".equals(event)
+                                        || event.startsWith("AOD_")) {
+                                    resetDesktopFollow();
+                                }
+                                return;
+                            }
+                            long now = SystemClock.elapsedRealtime();
+                            if (now - sDesktopFollowSettingsLoadedAt >= 1000L) {
+                                int oldScale = sDesktopFollowScalePercent;
+                                int oldDamping = sDesktopFollowDampingPercent;
+                                int oldResponse = sDesktopFollowResponsePercent;
+                                sDesktopFollowScalePercent = ModuleSettings.desktopFollowScale();
+                                sDesktopFollowDampingPercent =
+                                        ModuleSettings.desktopFollowDamping();
+                                sDesktopFollowResponsePercent =
+                                        ModuleSettings.desktopFollowResponse();
+                                sDesktopFollowSettingsLoadedAt = now;
+                                if (oldScale != sDesktopFollowScalePercent
+                                        || oldDamping != sDesktopFollowDampingPercent
+                                        || oldResponse != sDesktopFollowResponsePercent) {
+                                    resetDesktopFollow();
+                                    log(pkg + ": desktop follow scale="
+                                            + sDesktopFollowScalePercent + "% damping="
+                                            + sDesktopFollowDampingPercent + "% response="
+                                            + sDesktopFollowResponsePercent + "%");
+                                }
+                            }
+                            try {
+                                float offset = Float.parseFloat(event.substring(7));
+                                float target = 50.0f + (offset - 50.0f)
+                                        * sDesktopFollowScalePercent / 100.0f;
+                                if (sDesktopFollowDampingPercent == 100
+                                        && sDesktopFollowResponsePercent == 100) {
+                                    resetDesktopFollow();
+                                    param.args[0] = formatDesktopOffset(target);
+                                    return;
+                                }
+                                float filtered = sDesktopFollowSpring.onInput(
+                                        target, sDesktopFollowDampingPercent,
+                                        sDesktopFollowResponsePercent, now);
+                                sDesktopFollowTarget = param.thisObject;
+                                sDesktopFollowMethodName = methodName;
+                                param.args[0] = formatDesktopOffset(filtered);
+                                scheduleDesktopFollowContinuation();
+                            } catch (NumberFormatException e) {
+                                logErr(pkg + ": invalid desktop offset " + event, e);
+                            }
+                        }
+                    });
+            log(pkg + ": desktop follow controls hooked via " + methodName);
+        } catch (Throwable ignored) {
+            // Scene engines expose only one of the known message methods.
+        }
+    }
+
+    private static String formatDesktopOffset(float offset) {
+        float rounded = Math.round(offset * 10.0f) / 10.0f;
+        return "Offset_" + Float.toString(rounded);
+    }
+
+    private static void scheduleDesktopFollowContinuation() {
+        if (!sDesktopFollowSpring.hasPending()) return;
+        if (sDesktopFollowHandler == null) {
+            sDesktopFollowHandler = new Handler(Looper.getMainLooper());
+        }
+        sDesktopFollowHandler.removeCallbacks(sDesktopFollowContinuation);
+        sDesktopFollowHandler.postDelayed(sDesktopFollowContinuation, 8L);
+    }
+
+    private static void continueDesktopFollow() {
+        if (sDesktopFollowTarget == null || sDesktopFollowMethodName == null) {
+            resetDesktopFollow();
+            return;
+        }
+        float value = sDesktopFollowSpring.poll(
+                sDesktopFollowDampingPercent, sDesktopFollowResponsePercent,
+                SystemClock.elapsedRealtime());
+        if (!Float.isNaN(value)) {
+            try {
+                sDispatchingDesktopFollow.set(Boolean.TRUE);
+                XposedHelpers.callMethod(sDesktopFollowTarget,
+                        sDesktopFollowMethodName, formatDesktopOffset(value));
+            } catch (Throwable t) {
+                logErr("desktop follow continuation failed", t);
+                resetDesktopFollow();
+                return;
+            } finally {
+                sDispatchingDesktopFollow.remove();
+            }
+        }
+        scheduleDesktopFollowContinuation();
+    }
+
+    private static void resetDesktopFollow() {
+        sDesktopFollowSpring.reset();
+        sDesktopFollowTarget = null;
+        sDesktopFollowMethodName = null;
+        if (sDesktopFollowHandler != null) {
+            sDesktopFollowHandler.removeCallbacks(sDesktopFollowContinuation);
         }
     }
 
@@ -658,6 +1017,15 @@ public final class EntryPoint implements IXposedHookLoadPackage {
                     new XC_MethodHook() {
                         @Override
                         protected void beforeHookedMethod(MethodHookParam param) {
+                            sClassicAodPending = false;
+                            if (sClassicAodActive) {
+                                sClassicAodActive = false;
+                                sRestoreLockOnWake = true;
+                                sContinueAodRotation = false;
+                                sSuppressWakeLockEvent = false;
+                                log(pkg + ": legacy AOD wake -> restore lock scene");
+                                return;
+                            }
                             // onWakeUp 只代表从 AOD 回到锁屏，不代表已经进入桌面。
                             // 从唤醒到进入桌面期间持续抑制 Lock/ForceLock，避免静止帧被重置。
                             sContinueAodRotation = ModuleSettings.continueAodRotation();
@@ -665,6 +1033,34 @@ public final class EntryPoint implements IXposedHookLoadPackage {
                             log(pkg + ": onWakeUp -> lock renderer continuation="
                                     + sContinueAodRotation + " suppressWakeLockEvent="
                                     + sSuppressWakeLockEvent);
+                        }
+
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            if (!sRestoreLockOnWake) {
+                                return;
+                            }
+                            try {
+                                Object service = XposedHelpers.getObjectField(
+                                        param.thisObject, "this$0");
+                                String methodName = "com.miui.miwallpaper.earth".equals(pkg)
+                                        || "com.miui.miwallpaper.moon".equals(pkg)
+                                        ? "sendFilamentMessage" : "sendUnityMessage";
+                                new Handler(Looper.getMainLooper()).postDelayed(() -> {
+                                    if (!sRestoreLockOnWake) {
+                                        return;
+                                    }
+                                    try {
+                                        XposedHelpers.callMethod(service, methodName, "Lock");
+                                        log(pkg + ": classic AOD wake fallback Lock sent via "
+                                                + methodName);
+                                    } catch (Throwable t) {
+                                        logErr(pkg + ": classic AOD wake fallback Lock failed", t);
+                                    }
+                                }, CLASSIC_AOD_WAKE_FALLBACK_MS);
+                            } catch (Throwable t) {
+                                logErr(pkg + ": classic AOD wake fallback scheduling failed", t);
+                            }
                         }
                     });
             log(pkg + ": onWakeUp rotation lifecycle hooked");
@@ -680,6 +1076,9 @@ public final class EntryPoint implements IXposedHookLoadPackage {
                         protected void beforeHookedMethod(MethodHookParam param) {
                             sContinueAodRotation = false;
                             sSuppressWakeLockEvent = false;
+                            sClassicAodPending = false;
+                            sClassicAodActive = false;
+                            sRestoreLockOnWake = false;
                             sKeyguardGoingAwayUptime = android.os.SystemClock.uptimeMillis();
                             log(pkg + ": onKeyguardGoingAway -> allow OEM renderer pause lifecycle");
                         }

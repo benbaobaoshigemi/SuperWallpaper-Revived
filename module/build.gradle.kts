@@ -11,8 +11,18 @@ android {
         applicationId = "com.miui.superwallpapernoaod"
         minSdk = 26
         targetSdk = 36
-        versionCode = 8
-        versionName = "1.4.1"
+        versionCode = 9
+        versionName = "1.5.0"
+
+        ndk {
+            abiFilters += "arm64-v8a"
+        }
+
+        externalNativeBuild {
+            cmake {
+                cppFlags += "-std=c++20"
+            }
+        }
     }
 
     buildFeatures {
@@ -22,6 +32,13 @@ android {
     sourceSets["main"].java.srcDirs("src")
     sourceSets["main"].res.srcDirs("res")
     sourceSets["main"].manifest.srcFile("AndroidManifest.xml")
+
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
+    }
 
     packaging {
         resources.excludes += "/META-INF/{AL2.0,LGPL2.1}"

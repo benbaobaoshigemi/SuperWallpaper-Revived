@@ -34,6 +34,16 @@ public final class ModuleSettingsProvider extends ContentProvider {
                 preferences.getBoolean(ModuleSettings.KEY_APP_TRANSITION_ZOOM, true));
         values.putBoolean(ModuleSettings.KEY_FORCE_FULL_AOD,
                 preferences.getBoolean(ModuleSettings.KEY_FORCE_FULL_AOD, true));
+        values.putBoolean(ModuleSettings.KEY_NON_FULLSCREEN_AOD_TRANSITION,
+                preferences.getBoolean(ModuleSettings.KEY_NON_FULLSCREEN_AOD_TRANSITION, true));
+        values.putBoolean(ModuleSettings.KEY_CLASSIC_SUPER_WALLPAPER_AOD,
+                preferences.getBoolean(ModuleSettings.KEY_CLASSIC_SUPER_WALLPAPER_AOD, false));
+        values.putInt(ModuleSettings.KEY_DESKTOP_FOLLOW_SCALE,
+                preferences.getInt(ModuleSettings.KEY_DESKTOP_FOLLOW_SCALE, 100));
+        values.putInt(ModuleSettings.KEY_DESKTOP_FOLLOW_DAMPING,
+                preferences.getInt(ModuleSettings.KEY_DESKTOP_FOLLOW_DAMPING, 100));
+        values.putInt(ModuleSettings.KEY_DESKTOP_FOLLOW_RESPONSE,
+                preferences.getInt(ModuleSettings.KEY_DESKTOP_FOLLOW_RESPONSE, 100));
         return values;
     }
 

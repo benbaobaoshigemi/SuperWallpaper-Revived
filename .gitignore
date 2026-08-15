@@ -1,5 +1,6 @@
 # 构建产物（可再生）
 module/build/
+module/.cxx/
 module/*.apk
 module/*.apk.idsig
 *.idsig

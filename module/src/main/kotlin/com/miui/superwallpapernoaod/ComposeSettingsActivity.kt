@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -25,8 +26,10 @@ import top.yukonga.miuix.kmp.basic.Scaffold
 import top.yukonga.miuix.kmp.basic.SmallTitle
 import top.yukonga.miuix.kmp.basic.SmallTopAppBar
 import top.yukonga.miuix.kmp.preference.ArrowPreference
+import top.yukonga.miuix.kmp.preference.SliderPreference
 import top.yukonga.miuix.kmp.preference.SwitchPreference
 import top.yukonga.miuix.kmp.theme.MiuixTheme
+import kotlin.math.roundToInt
 
 class ComposeSettingsActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -70,6 +73,25 @@ private fun SettingsScreen(activity: Activity) {
     var forceFullAod by remember {
         mutableStateOf(preferences.getBoolean(ModuleSettings.KEY_FORCE_FULL_AOD, true))
     }
+    var nonFullscreenAodTransition by remember {
+        mutableStateOf(
+            preferences.getBoolean(ModuleSettings.KEY_NON_FULLSCREEN_AOD_TRANSITION, true),
+        )
+    }
+    var classicSuperWallpaperAod by remember {
+        mutableStateOf(
+            preferences.getBoolean(ModuleSettings.KEY_CLASSIC_SUPER_WALLPAPER_AOD, false),
+        )
+    }
+    var desktopFollowScale by remember {
+        mutableFloatStateOf(preferences.getInt(ModuleSettings.KEY_DESKTOP_FOLLOW_SCALE, 100).toFloat())
+    }
+    var desktopFollowDamping by remember {
+        mutableFloatStateOf(preferences.getInt(ModuleSettings.KEY_DESKTOP_FOLLOW_DAMPING, 100).toFloat())
+    }
+    var desktopFollowResponse by remember {
+        mutableFloatStateOf(preferences.getInt(ModuleSettings.KEY_DESKTOP_FOLLOW_RESPONSE, 100).toFloat())
+    }
     var status by remember { mutableStateOf("") }
 
     MiuixTheme {
@@ -109,6 +131,19 @@ private fun SettingsScreen(activity: Activity) {
                             },
                         )
                         SwitchPreference(
+                            title = "非全屏AOD过场",
+                            summary = "从桌面息屏时先播放超级壁纸转场，再渐隐到AOD",
+                            checked = nonFullscreenAodTransition,
+                            onCheckedChange = {
+                                nonFullscreenAodTransition = it
+                                ModuleSettings.save(
+                                    activity,
+                                    ModuleSettings.KEY_NON_FULLSCREEN_AOD_TRANSITION,
+                                    it,
+                                )
+                            },
+                        )
+                        SwitchPreference(
                             title = "AOD壁纸压暗",
                             summary = "压暗程度跟随系统息屏亮度自动变化",
                             checked = reuseDimming,
@@ -133,6 +168,73 @@ private fun SettingsScreen(activity: Activity) {
                             onCheckedChange = {
                                 continueAodRotation = it
                                 ModuleSettings.save(activity, ModuleSettings.KEY_CONTINUE_AOD_ROTATION, it)
+                            },
+                        )
+                        SwitchPreference(
+                            title = "经典超级壁纸AOD",
+                            summary = "从桌面息屏时播放原版AOD，唤醒后返回锁屏样式",
+                            checked = classicSuperWallpaperAod,
+                            onCheckedChange = {
+                                classicSuperWallpaperAod = it
+                                ModuleSettings.save(
+                                    activity,
+                                    ModuleSettings.KEY_CLASSIC_SUPER_WALLPAPER_AOD,
+                                    it,
+                                )
+                            },
+                        )
+                        SliderPreference(
+                            title = "跟随幅度",
+                            summary = "控制桌面滑动带动超级壁纸移动的范围",
+                            value = desktopFollowScale,
+                            valueText = "${desktopFollowScale.roundToInt()}%",
+                            valueRange = 0f..400f,
+                            steps = 15,
+                            showKeyPoints = true,
+                            keyPoints = listOf(0f, 100f, 200f, 300f, 400f),
+                            onValueChange = { desktopFollowScale = it },
+                            onValueChangeFinished = {
+                                ModuleSettings.save(
+                                    activity,
+                                    ModuleSettings.KEY_DESKTOP_FOLLOW_SCALE,
+                                    desktopFollowScale.roundToInt(),
+                                )
+                            },
+                        )
+                        SliderPreference(
+                            title = "稳定程度",
+                            summary = "数值越高越平稳，越低越容易产生回弹",
+                            value = desktopFollowDamping,
+                            valueText = "${desktopFollowDamping.roundToInt()}%",
+                            valueRange = 0f..400f,
+                            steps = 15,
+                            showKeyPoints = true,
+                            keyPoints = listOf(0f, 100f, 200f, 300f, 400f),
+                            onValueChange = { desktopFollowDamping = it },
+                            onValueChangeFinished = {
+                                ModuleSettings.save(
+                                    activity,
+                                    ModuleSettings.KEY_DESKTOP_FOLLOW_DAMPING,
+                                    desktopFollowDamping.roundToInt(),
+                                )
+                            },
+                        )
+                        SliderPreference(
+                            title = "跟手程度",
+                            summary = "数值越高越贴近手指，越低动作越舒缓",
+                            value = desktopFollowResponse,
+                            valueText = "${desktopFollowResponse.roundToInt()}%",
+                            valueRange = 25f..400f,
+                            steps = 14,
+                            showKeyPoints = true,
+                            keyPoints = listOf(25f, 100f, 200f, 300f, 400f),
+                            onValueChange = { desktopFollowResponse = it },
+                            onValueChangeFinished = {
+                                ModuleSettings.save(
+                                    activity,
+                                    ModuleSettings.KEY_DESKTOP_FOLLOW_RESPONSE,
+                                    desktopFollowResponse.roundToInt(),
+                                )
                             },
                         )
                     }
